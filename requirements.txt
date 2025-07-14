@@ -1,0 +1,17 @@
+# For Google API and HTTP requests
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+requests
+
+# For reading .env files
+python-dotenv
+
+# For report_matcher.py
+pandas
+openpyxl
+fuzzywuzzy
+python-Levenshtein
+google-generativeai
+docx2pdf
+PyPDF2

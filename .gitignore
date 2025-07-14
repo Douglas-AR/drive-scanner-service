@@ -1,0 +1,16 @@
+# Authentication credentials and secrets
+authentication/
+
+# Python virtual environment
+venv/
+
+# Logs and temporary files
+logs/
+temp_files/
+*.log
+*.save
+
+# Python cache
+__pycache__/
+*.pyc
+
