@@ -44,6 +44,7 @@ load_dotenv()
 NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA"
 BASE_UPLOAD_FOLDER_NAME = "3-NTBLM"
 LOGS_SUBFOLDER_NAME = "Logs"
+PREPARATION_PLANS_SUBFOLDER_NAME = "PreparationPlans" # New folder for individual plans
 DRIVE_API_V3_URL = "https://www.googleapis.com/drive/v3"
 NOTEBOOKLM_COMPATIBLE_MIMETYPES = ["application/pdf", "text/plain", "text/markdown", "audio/mpeg"]
 CONCATENATION_SIZE_LIMIT_MB = 190
@@ -71,6 +72,19 @@ def find_drive_item(session, name, parent_id=None, drive_id=None):
         files = response.json().get('files', [])
         return files[0] if files else None
     except Exception: return None
+
+def find_or_create_folder(session, folder_name, parent_id, drive_id):
+    folder = find_drive_item(session, folder_name, parent_id=parent_id, drive_id=drive_id)
+    if folder: return folder['id']
+    try:
+        file_metadata = {'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
+        response = session.post(f"{DRIVE_API_V3_URL}/files", json=file_metadata, params={'supportsAllDrives': 'true'})
+        response.raise_for_status()
+        logging.info(f"Created folder '{folder_name}'.")
+        return response.json()['id']
+    except Exception as e:
+        logging.error(f"Failed to create folder '{folder_name}': {e}")
+        return None
 
 def download_file(session, file_id, destination_path):
     try:
@@ -103,6 +117,26 @@ def backup_and_upload(session, local_path, folder_id, drive_id, current_filename
         logging.info(f"Successfully uploaded new '{current_filename}'.")
     except Exception as e:
         logging.error(f"Backup and upload failed for '{current_filename}': {e}")
+
+def upload_or_overwrite_file(session, local_path, folder_id, drive_id, drive_filename):
+    """Uploads a file, overwriting any existing file with the same name."""
+    if not local_path.exists() or local_path.stat().st_size == 0:
+        logging.info(f"Local file '{local_path.name}' is empty or missing. Skipping upload for '{drive_filename}'.")
+        return
+    try:
+        existing_file = find_drive_item(session, drive_filename, parent_id=folder_id, drive_id=drive_id)
+        if existing_file:
+            session.delete(f"{DRIVE_API_V3_URL}/files/{existing_file['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
+            logging.info(f"Deleted existing file '{drive_filename}' to overwrite.")
+
+        file_metadata = {'name': drive_filename, 'parents': [folder_id]}
+        with open(local_path, 'rb') as f:
+            files = {'data': ('metadata', json.dumps(file_metadata), 'application/json'), 'file': f}
+            response = session.post(f"https://www.googleapis.com/upload/drive/v3/files", params={'uploadType': 'multipart', 'supportsAllDrives': 'true'}, files=files)
+            response.raise_for_status()
+        logging.info(f"Successfully uploaded '{drive_filename}'.")
+    except Exception as e:
+        logging.error(f"Upload/overwrite failed for '{drive_filename}': {e}")
 
 # --- Planner-Specific Functions ---
 def get_task_for_file(file_info):
@@ -171,9 +205,15 @@ def main():
 
     try:
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        
         ntblm_folder = find_drive_item(session, BASE_UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
         if not ntblm_folder:
             return logging.critical(f"Could not find the base folder '{BASE_UPLOAD_FOLDER_NAME}'. Exiting.")
+        
+        # Create the main folder for all preparation plans
+        plans_folder_id = find_or_create_folder(session, PREPARATION_PLANS_SUBFOLDER_NAME, ntblm_folder['id'], NTBLM_DRIVE_ID)
+        if not plans_folder_id:
+            return logging.critical(f"Could not create the '{PREPARATION_PLANS_SUBFOLDER_NAME}' folder. Exiting.")
 
         matcher_results_item = find_drive_item(session, "matching_results.json", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
         scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
@@ -191,37 +231,43 @@ def main():
         all_matched_clients = [name for name, folder in matcher_data.get("client_to_folder_map", {}).items() if folder]
         if not all_matched_clients:
             return logging.info("No matched clients found to plan for. Exiting.")
-        logging.info(f"Planning for all {len(all_matched_clients)} matched clients.")
-
-        logging.info("Generating processing tasks in parallel...")
-        files_to_process = []
+        
+        logging.info(f"Starting to generate individual plans for {len(all_matched_clients)} clients.")
         client_folder_map = matcher_data.get("client_to_folder_map", {})
+
         for client_name in all_matched_clients:
+            logging.info(f"--- Planning for client: {client_name} ---")
             client_folder_info = client_folder_map.get(client_name)
-            if not client_folder_info: continue
+            if not client_folder_info:
+                logging.warning(f"Skipping client '{client_name}' as no folder info was found.")
+                continue
+            
             client_folder_path = client_folder_info.get("path")
             client_files = [item for item in scan_data if item.get("path", "").startswith(client_folder_path)]
+            
             for file_info in client_files:
                 file_info["client_master_name"] = client_name
-                files_to_process.append(file_info)
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            processing_tasks = list(executor.map(get_task_for_file, files_to_process))
-        logging.info(f"Generated {len(processing_tasks)} processing tasks.")
-
-        concatenation_plan = plan_concatenation(processing_tasks)
-        final_plan = {
-            "plan_generated_at": datetime.now().isoformat(),
-            "clients_in_this_plan": all_matched_clients,
-            "processing_tasks": processing_tasks,
-            "concatenation_plan": concatenation_plan
-        }
-        
-        local_plan_path = TEMP_DIR / "preparation_plan.json"
-        with open(local_plan_path, 'w', encoding='utf-8') as f:
-            json.dump(final_plan, f, indent=2, ensure_ascii=False)
-        
-        backup_and_upload(session, local_plan_path, ntblm_folder['id'], NTBLM_DRIVE_ID, "preparation_plan.json", "preparation_plan_last_run.json")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                processing_tasks = list(executor.map(get_task_for_file, client_files))
+            
+            concatenation_plan = plan_concatenation(processing_tasks)
+            
+            client_plan = {
+                "plan_generated_at": datetime.now().isoformat(),
+                "client_master_name": client_name,
+                "processing_tasks": processing_tasks,
+                "concatenation_plan": concatenation_plan
+            }
+            
+            safe_filename = "".join(c for c in client_name if c.isalnum() or c in (' ', '_')).rstrip()
+            plan_filename = f"{safe_filename}_plan.json"
+            local_plan_path = TEMP_DIR / plan_filename
+            
+            with open(local_plan_path, 'w', encoding='utf-8') as f:
+                json.dump(client_plan, f, indent=2, ensure_ascii=False)
+            
+            upload_or_overwrite_file(session, local_plan_path, plans_folder_id, NTBLM_DRIVE_ID, plan_filename)
 
     except Exception as e:
         logging.critical(f"A critical error occurred in the main planner process: {e}", exc_info=True)
@@ -231,6 +277,7 @@ def main():
             logs_folder_id = find_drive_item(session, LOGS_SUBFOLDER_NAME, parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
             if logs_folder_id:
                 backup_and_upload(session, LOG_FILE_PATH, logs_folder_id['id'], NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
+        
         if TEMP_DIR.exists():
             shutil.rmtree(TEMP_DIR)
         logging.info(f"--- {APP_NAME} Finished ---")
