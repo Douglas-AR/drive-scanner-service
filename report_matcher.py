@@ -139,6 +139,10 @@ def parse_report(file_path):
         return [], []
 
 def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_folders: list[dict]):
+    if not raw_client_names:
+        logging.info("No new client names to process.")
+        return {}, {}
+        
     genai.configure(api_key=GEMINI_API_KEY) # type: ignore
     model = genai.GenerativeModel(GEMINI_MODEL_NAME) # type: ignore
     
@@ -165,10 +169,9 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
     2. "match_map": A dictionary mapping each "master name" to its corresponding folder name from <Drive_Folder_Names> (or null if no match).
     """
     try:
-        logging.info(f"Sending {len(drive_folders)} folders and {len(raw_client_names)} raw names to Gemini ({GEMINI_MODEL_NAME}) for consolidation and matching...")
+        logging.info(f"Sending {len(drive_folders)} folders and {len(raw_client_names)} new raw names to Gemini ({GEMINI_MODEL_NAME}) for consolidation and matching...")
         response = model.generate_content(prompt)
         
-        # Robustly find and parse the JSON block
         match = re.search(r'```json\s*([\s\S]+?)\s*```', response.text, re.DOTALL)
         if not match:
             logging.error("AI response did not contain a valid JSON block.")
@@ -184,7 +187,7 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
         folder_lookup = {f['name']: f for f in drive_folders}
         final_match_map = {master_name: folder_lookup.get(folder_name) for master_name, folder_name in preliminary_match_map.items()}
         
-        logging.info("Successfully received and processed AI results.")
+        logging.info("Successfully received and processed AI results for new clients.")
         return consolidation_map, final_match_map
     except Exception as e:
         logging.error(f"AI matching failed: {e}", exc_info=True)
@@ -244,37 +247,56 @@ def main():
         logs_folder_id = find_or_create_folder(session, LOGS_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
         trees_folder_id = find_or_create_folder(session, MATCHED_TREES_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
         
-        scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID) or \
-                         find_drive_item(session, "drive_scan_last_run.jsonl", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
-        
+        # --- Load Current and Previous Data ---
+        scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
+        last_match_item = find_drive_item(session, "matching_results_last_run.json", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
         reports_folder = find_drive_item(session, REPORTS_SUBFOLDER_NAME, parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
         report_file_item = find_drive_item(session, ".xlsx", parent_id=reports_folder['id'], drive_id=NTBLM_DRIVE_ID, order_by="modifiedTime desc") if reports_folder else None
         
         if not (scan_file_item and report_file_item):
-            return logging.critical("Could not find necessary input files (scan or report). Exiting.")
+            return logging.critical("Could not find necessary input files (current scan or report). Exiting.")
 
         local_scan_path = TEMP_DIR / "drive_scan.jsonl"
         local_report_path = TEMP_DIR / report_file_item['name']
+        local_last_match_path = TEMP_DIR / "matching_results_last_run.json"
         
-        if not (download_file(session, scan_file_item['id'], local_scan_path) and download_file(session, report_file_item['id'], local_report_path)):
-            return logging.critical("Failed to download necessary input files. Exiting.")
+        download_file(session, scan_file_item['id'], local_scan_path)
+        download_file(session, report_file_item['id'], local_report_path)
+        
+        old_consolidation = {}
+        old_matches = {}
+        if last_match_item and download_file(session, last_match_item['id'], local_last_match_path):
+            with open(local_last_match_path, 'r', encoding='utf-8') as f:
+                last_run_data = json.load(f)
+            old_consolidation = last_run_data.get('report_client_consolidation_map', {})
+            old_matches = last_run_data.get('client_to_folder_map', {})
+            logging.info(f"Loaded {len(old_matches)} matches from the last run.")
 
         with open(local_scan_path, 'r', encoding='utf-8') as f: scan_data = [json.loads(line) for line in f if line.strip()]
         parsed_rows, raw_client_names = parse_report(local_report_path)
         
+        # --- Identify New Clients to Process ---
+        new_clients_to_process = [name for name in raw_client_names if name not in old_consolidation]
+        logging.info(f"Found {len(new_clients_to_process)} new client names to process from the report.")
+
         root_name = next((item['name'] for item in scan_data if item['id'] == DRIVE_FOLDER_ID), "ROOT")
         client_folders = [item for item in scan_data if item.get('indent') == 1 and (item.get('path','').startswith(f"{root_name}/{CLIENTES_ATUAIS_NAME}/") or item.get('path','').startswith(f"{root_name}/{CLIENTES_INATIVOS_NAME}/"))]
 
-        consolidation_map, client_to_folder_map = perform_ai_consolidation_and_matching(raw_client_names, client_folders)
+        # --- Process Only New Clients ---
+        new_consolidation, new_matches = perform_ai_consolidation_and_matching(new_clients_to_process, client_folders)
+
+        # --- Merge Old and New Results ---
+        final_consolidation = {**old_consolidation, **new_consolidation}
+        final_matches = {**old_matches, **new_matches}
         
-        results_to_save = {'client_to_folder_map': client_to_folder_map, 'report_client_consolidation_map': consolidation_map, 'all_parsed_report_rows': parsed_rows}
+        results_to_save = {'client_to_folder_map': final_matches, 'report_client_consolidation_map': final_consolidation, 'all_parsed_report_rows': parsed_rows}
         local_match_path = TEMP_DIR / "matching_results.json"
         with open(local_match_path, 'w', encoding='utf-8') as f: json.dump(results_to_save, f, indent=2, ensure_ascii=False)
         
         backup_and_upload(session, local_match_path, ntblm_folder_id, NTBLM_DRIVE_ID, "matching_results.json", "matching_results_last_run.json")
         
         if trees_folder_id:
-            generate_and_upload_client_trees(session, client_to_folder_map, scan_data, trees_folder_id, NTBLM_DRIVE_ID)
+            generate_and_upload_client_trees(session, final_matches, scan_data, trees_folder_id, NTBLM_DRIVE_ID)
 
     except Exception as e:
         logging.critical(f"A critical error occurred in the main process: {e}", exc_info=True)
@@ -290,4 +312,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# --- End of report_matcher.py ---
