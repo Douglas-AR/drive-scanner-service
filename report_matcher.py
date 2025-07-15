@@ -18,6 +18,7 @@ from google.auth.transport.requests import AuthorizedSession
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 # --- Basic Configuration ---
 APP_NAME = "ReportMatcher"
@@ -170,8 +171,24 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
     """
     try:
         logging.info(f"Sending {len(drive_folders)} folders and {len(raw_client_names)} new raw names to Gemini ({GEMINI_MODEL_NAME}) for consolidation and matching...")
-        response = model.generate_content(prompt)
         
+        # Define safety settings to be less restrictive
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
+
+        response = model.generate_content(prompt, safety_settings=safety_settings)
+        
+        # Check for blocked response before accessing .text
+        if not response.parts:
+            logging.error("AI response was blocked or empty.")
+            if response.prompt_feedback:
+                logging.error(f"Prompt Feedback: {response.prompt_feedback}")
+            return {}, {}
+
         match = re.search(r'```json\s*([\s\S]+?)\s*```', response.text, re.DOTALL)
         if not match:
             logging.error("AI response did not contain a valid JSON block.")
