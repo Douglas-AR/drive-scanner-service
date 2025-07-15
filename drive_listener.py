@@ -39,8 +39,8 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 # --- Load .env and Set Constants ---
 load_dotenv()
 DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
-NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA"
-UPLOAD_FOLDER_NAME = "3-NTBLM"
+NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA" # This is the ID for the "TI" Shared Drive
+UPLOAD_FOLDER_NAME = "3-NTBLM" # The folder to find inside the "TI" drive
 REPORTS_SUBFOLDER_NAME = "Reports"
 LOGS_SUBFOLDER_NAME = "Logs"
 POLLING_INTERVAL_SECONDS = 600
@@ -68,7 +68,6 @@ def find_drive_item_by_name(session, name, parent_id=None, drive_id=None, mime_t
     safe_name = name.replace("'", "\\'")
     query_parts = [f"name = '{safe_name}'" if not name.startswith(".") else f"name contains '{safe_name}'", "trashed = false"]
     if parent_id: query_parts.append(f"'{parent_id}' in parents")
-    if mime_type: query_parts.append(f"mimeType = '{mime_type}'")
     params = {'q': " and ".join(query_parts), 'fields': 'files(id, name, modifiedTime)', 'supportsAllDrives': True, 'includeItemsFromAllDrives': True}
     if drive_id: params['driveId'] = drive_id; params['corpora'] = 'drive'
     if order_by: params['orderBy'] = order_by
