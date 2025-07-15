@@ -34,11 +34,15 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # --- Load .env and Set Constants ---
 load_dotenv()
-DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
+# ID of the Shared Drive to be SCANNED (used for context, not primary target)
+DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID') 
+# ID of the Shared Drive where the NTBLM folder is located
+NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA"
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME', 'gemini-1.5-flash-latest')
 
-BASE_UPLOAD_FOLDER_NAME = "16. NTBLM"
+# Name of the folder where input/output files are stored
+BASE_UPLOAD_FOLDER_NAME = "3-NTBLM"
 REPORTS_SUBFOLDER_NAME = "Reports"
 CLIENTES_ATUAIS_NAME = "1. CLIENTES ATUAIS"
 CLIENTES_INATIVOS_NAME = "3. CLIENTES INATIVOS"
@@ -93,7 +97,7 @@ def download_file(session, file_id, destination_path):
 
 def upload_file(session, local_path, folder_id, drive_filename):
     try:
-        existing = find_drive_item(session, drive_filename, parent_id=folder_id, drive_id=DRIVE_FOLDER_ID)
+        existing = find_drive_item(session, drive_filename, parent_id=folder_id, drive_id=NTBLM_DRIVE_ID)
         if existing:
             session.delete(f"{DRIVE_API_V3_URL}/files/{existing['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
         
@@ -189,12 +193,15 @@ def main():
 
     ntblm_folder, scan_file_item, report_file_item = None, None, None
     for attempt in range(3):
-        ntblm_folder = find_drive_item(session, BASE_UPLOAD_FOLDER_NAME, drive_id=DRIVE_FOLDER_ID)
+        # Find the base folder in the correct Shared Drive
+        ntblm_folder = find_drive_item(session, BASE_UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
         if ntblm_folder:
-            scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder['id'], drive_id=DRIVE_FOLDER_ID)
-            reports_folder = find_drive_item(session, REPORTS_SUBFOLDER_NAME, parent_id=ntblm_folder['id'], drive_id=DRIVE_FOLDER_ID)
+            # Find the other files inside it
+            scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
+            reports_folder = find_drive_item(session, REPORTS_SUBFOLDER_NAME, parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
             if reports_folder:
-                report_file_item = find_drive_item(session, ".xlsx", parent_id=reports_folder['id'], drive_id=DRIVE_FOLDER_ID, order_by="modifiedTime desc")
+                report_file_item = find_drive_item(session, ".xlsx", parent_id=reports_folder['id'], drive_id=NTBLM_DRIVE_ID, order_by="modifiedTime desc")
+        
         if scan_file_item and report_file_item: break
         logging.warning(f"Attempt {attempt+1}/3: Critical input files not found. Retrying in 10 seconds...")
         time.sleep(10)

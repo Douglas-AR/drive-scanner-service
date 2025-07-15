@@ -1,5 +1,6 @@
 # Authentication credentials and secrets
 authentication/
+.env
 
 # Python virtual environment
 venv/

@@ -36,8 +36,12 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # --- Load .env and Set Constants ---
 load_dotenv()
-DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
-UPLOAD_FOLDER_NAME = "16. NTBLM"
+# ID of the Shared Drive to be SCANNED for changes
+DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID') 
+# ID of the Shared Drive where the NTBLM folder is located
+NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA" 
+# Name of the folder for uploads
+UPLOAD_FOLDER_NAME = "3-NTBLM" 
 REPORTS_SUBFOLDER_NAME = "Reports"
 POLLING_INTERVAL_SECONDS = 600
 SCHEDULED_RESCAN_HOURS = 6
@@ -208,9 +212,14 @@ def run_full_scan_workflow(session):
     local_scan_path = TEMP_DIR / "drive_scan.jsonl"
     with open(local_scan_path, 'w', encoding='utf-8') as f:
         f.write("\n".join([json.dumps(item, ensure_ascii=False) for item in scan_results]))
-    upload_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=DRIVE_FOLDER_ID)
+    
+    # Find the upload folder in the correct Shared Drive
+    upload_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
     if upload_folder:
         upload_file(session, local_scan_path, upload_folder['id'], "drive_scan.jsonl")
+    else:
+        logging.error(f"Could not find the upload folder '{UPLOAD_FOLDER_NAME}' in the specified NTBLM drive.")
+
     logging.info("FULL update workflow complete.")
     # --- TRIGGER REMOVED ---
     # The report matcher is no longer triggered by a full scan.
@@ -220,8 +229,13 @@ def run_full_scan_workflow(session):
 def run_patch_workflow(session, changes):
     logging.info(f"Starting PATCH update workflow for {len(changes)} changes...")
     try:
-        upload_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=DRIVE_FOLDER_ID)
-        scan_file_item = find_drive_item_by_name(session, "drive_scan.jsonl", parent_id=upload_folder['id'], drive_id=DRIVE_FOLDER_ID) if upload_folder else None
+        # Find the upload folder in the correct Shared Drive
+        upload_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
+        if not upload_folder:
+            logging.error(f"Could not find the upload folder '{UPLOAD_FOLDER_NAME}' in the specified NTBLM drive. Falling back to full scan.")
+            return run_full_scan_workflow(session)
+
+        scan_file_item = find_drive_item_by_name(session, "drive_scan.jsonl", parent_id=upload_folder['id'], drive_id=NTBLM_DRIVE_ID)
         if not scan_file_item:
             logging.error("Could not find drive_scan.jsonl to patch. Falling back to full scan.")
             return run_full_scan_workflow(session)
