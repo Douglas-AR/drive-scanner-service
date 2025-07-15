@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from collections import deque
 import concurrent.futures
-from datetime import datetime
+import filecmp
 
 import requests
 from dotenv import load_dotenv
@@ -50,7 +50,7 @@ if not DRIVE_FOLDER_ID:
     logging.critical("CRITICAL: DRIVE_FOLDER_ID not set in .env file. Exiting.")
     sys.exit(1)
 
-# --- Core Functions ---
+# ... (All core functions like get_credentials, find_drive_item, backup_and_upload, etc. remain the same) ...
 def get_credentials():
     if not SERVICE_ACCOUNT_KEY_PATH.exists():
         logging.critical(f"Service account key file not found at: {SERVICE_ACCOUNT_KEY_PATH}")
@@ -94,31 +94,24 @@ def backup_and_upload(session, local_path, folder_id, drive_id, current_filename
         logging.info(f"Local file '{local_path.name}' is empty or missing. Skipping upload for '{current_filename}'.")
         return
     try:
-        # 1. Find the existing file to be backed up
         existing_file = find_drive_item_by_name(session, current_filename, parent_id=folder_id, drive_id=drive_id)
         if existing_file:
-            # 2. Delete any old backup file first
             old_backup = find_drive_item_by_name(session, backup_filename, parent_id=folder_id, drive_id=drive_id)
             if old_backup:
                 session.delete(f"{DRIVE_API_V3_URL}/files/{old_backup['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
-                logging.info(f"Deleted old backup file: {backup_filename}")
-            
-            # 3. Rename the current file to become the new backup
             update_metadata = {'name': backup_filename}
             session.patch(f"{DRIVE_API_V3_URL}/files/{existing_file['id']}", json=update_metadata, params={'supportsAllDrives': 'true'}).raise_for_status()
             logging.info(f"Backed up '{current_filename}' to '{backup_filename}'.")
-
-        # 4. Upload the new file with the original name
+        
         file_metadata = {'name': current_filename, 'parents': [folder_id]}
         with open(local_path, 'rb') as f:
             files = {'data': ('metadata', json.dumps(file_metadata), 'application/json'), 'file': f}
             response = session.post(f"https://www.googleapis.com/upload/drive/v3/files", params={'uploadType': 'multipart', 'supportsAllDrives': 'true'}, files=files)
             response.raise_for_status()
-            logging.info(f"Successfully uploaded new '{current_filename}'.")
+        logging.info(f"Successfully uploaded new '{current_filename}'.")
     except Exception as e:
         logging.error(f"Backup and upload failed for '{current_filename}': {e}")
 
-# ... (rest of the core functions from your original file) ...
 def get_item_metadata(session, item_id, fields="id,name,mimeType,parents,driveId"):
     try:
         response = session.get(f"{DRIVE_API_V3_URL}/files/{item_id}", params={'fields': fields, 'supportsAllDrives': 'true'})
@@ -220,6 +213,34 @@ def load_state():
         with open(STATE_FILE, 'r') as f: return json.load(f)
     except Exception: return {}
 
+def trigger_downstream_scripts(session, upload_folder_id):
+    """Checks if the scan file has changed and triggers other scripts if needed."""
+    logging.info("Checking if downstream scripts need to be triggered...")
+    
+    # Download current and last run scan files
+    current_scan_item = find_drive_item_by_name(session, "drive_scan.jsonl", parent_id=upload_folder_id, drive_id=NTBLM_DRIVE_ID)
+    last_run_scan_item = find_drive_item_by_name(session, "drive_scan_last_run.jsonl", parent_id=upload_folder_id, drive_id=NTBLM_DRIVE_ID)
+
+    if not current_scan_item or not last_run_scan_item:
+        logging.warning("Could not find both current and last_run scan files. Triggering all scripts as a precaution.")
+        os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'}")
+        os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'}")
+        return
+
+    local_current_path = TEMP_DIR / "current_scan_for_compare.jsonl"
+    local_last_run_path = TEMP_DIR / "last_run_scan_for_compare.jsonl"
+    
+    download_file(session, current_scan_item['id'], local_current_path)
+    download_file(session, last_run_scan_item['id'], local_last_run_path)
+
+    # Compare the files
+    if not filecmp.cmp(local_current_path, local_last_run_path, shallow=False):
+        logging.info("Scan file has changed. Triggering report_matcher.py and preparation_planner.py.")
+        os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'}")
+        os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'}")
+    else:
+        logging.info("Scan file has not changed. No need to trigger planner.")
+
 # --- Workflow Functions ---
 def run_full_scan_workflow(session):
     logging.info("Starting FULL update workflow...")
@@ -237,6 +258,7 @@ def run_full_scan_workflow(session):
     upload_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
     if upload_folder:
         backup_and_upload(session, local_scan_path, upload_folder['id'], NTBLM_DRIVE_ID, "drive_scan.jsonl", "drive_scan_last_run.jsonl")
+        trigger_downstream_scripts(session, upload_folder['id'])
     else:
         logging.error(f"Could not find the upload folder '{UPLOAD_FOLDER_NAME}' in the specified NTBLM drive.")
 
@@ -248,16 +270,13 @@ def run_patch_workflow(session, changes):
     try:
         upload_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
         if not upload_folder:
-            logging.error(f"Could not find '{UPLOAD_FOLDER_NAME}'. Falling back to full scan.")
             return run_full_scan_workflow(session)
 
         scan_file_item = find_drive_item_by_name(session, "drive_scan.jsonl", parent_id=upload_folder['id'], drive_id=NTBLM_DRIVE_ID) or \
                          find_drive_item_by_name(session, "drive_scan_last_run.jsonl", parent_id=upload_folder['id'], drive_id=NTBLM_DRIVE_ID)
         if not scan_file_item:
-            logging.error("Could not find drive_scan.jsonl or a backup to patch. Falling back to full scan.")
             return run_full_scan_workflow(session)
         
-        logging.info(f"Patching based on file: {scan_file_item['name']}")
         local_scan_path = TEMP_DIR / "drive_scan.jsonl"
         download_file(session, scan_file_item['id'], local_scan_path)
         with open(local_scan_path, 'r', encoding='utf-8') as f: scan_cache = [json.loads(line) for line in f if line.strip()]
@@ -265,19 +284,17 @@ def run_patch_workflow(session, changes):
         cache_by_id = {item['id']: item for item in scan_cache}
         root_name = next((item['name'] for item in scan_cache if item['id'] == DRIVE_FOLDER_ID), "ROOT")
         path_cache = {DRIVE_FOLDER_ID: root_name}
-
-        trigger_matcher = False
+        
         reports_folder_path_segment = f"/{REPORTS_SUBFOLDER_NAME}/"
+        client_folder_change = False
         
         for change in changes:
-            if change.get('changeType') == 'drive':
-                return run_full_scan_workflow(session)
-
+            if change.get('changeType') == 'drive': return run_full_scan_workflow(session)
             file_id = change.get('fileId')
             if change.get('removed'):
                 if file_id in cache_by_id:
-                    if reports_folder_path_segment in cache_by_id[file_id].get('path', ''):
-                        trigger_matcher = True
+                    if reports_folder_path_segment not in cache_by_id[file_id].get('path', ''):
+                        client_folder_change = True
                     del cache_by_id[file_id]
                 continue
 
@@ -286,12 +303,10 @@ def run_patch_workflow(session, changes):
                 return run_full_scan_workflow(session)
 
             new_path = get_full_path(session, file_id, path_cache, root_name)
-            if reports_folder_path_segment in new_path:
-                trigger_matcher = True
-            
+            if reports_folder_path_segment not in new_path:
+                client_folder_change = True
+
             new_indent = new_path.count('/') -1
-            if file_data.get('mimeType') == 'application/vnd.google-apps.folder':
-                 pass # In a real scenario, you'd rescan the folder here.
             cache_by_id[file_id] = {**file_data, 'path': new_path, 'indent': new_indent}
 
         updated_scan_list = sorted(list(cache_by_id.values()), key=lambda x: x.get('path', ''))
@@ -299,13 +314,14 @@ def run_patch_workflow(session, changes):
             f.write("\n".join([json.dumps(item, ensure_ascii=False) for item in updated_scan_list]))
 
         backup_and_upload(session, local_scan_path, upload_folder['id'], NTBLM_DRIVE_ID, "drive_scan.jsonl", "drive_scan_last_run.jsonl")
-        logging.info("PATCH update workflow complete.")
-
-        if trigger_matcher:
-            logging.info("Triggering report matcher because relevant changes were detected.")
-            os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'}")
+        
+        if client_folder_change:
+            logging.info("Client folder changes detected. Triggering preparation planner.")
+            trigger_downstream_scripts(session, upload_folder['id'])
         else:
-            logging.info("No changes detected in the Reports folder. Skipping report matcher.")
+            logging.info("Only report folder changes detected. Triggering only the report matcher.")
+            os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'}")
+        
         return True
     except Exception as e:
         logging.error(f"Error during PATCH workflow: {e}. Falling back to full scan.")
@@ -316,8 +332,7 @@ def main():
     adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 503]))
     session.mount("https://", adapter)
     
-    ntblm_folder_id = None
-    logs_folder_id = None
+    ntblm_folder_id, logs_folder_id = None, None
     try:
         ntblm_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
         if ntblm_folder:
@@ -325,52 +340,30 @@ def main():
             logs_folder_id = find_or_create_folder(session, LOGS_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
 
         state = load_state()
-        last_token = state.get("startPageToken")
-        last_scan_timestamp = state.get("last_full_scan_timestamp", 0)
+        last_token, last_scan_timestamp = state.get("startPageToken"), state.get("last_full_scan_timestamp", 0)
 
         if not last_token:
-            logging.warning("No state token found. Running initial workflow.")
             if run_full_scan_workflow(session):
                 last_token = get_start_page_token(session, DRIVE_FOLDER_ID)
                 last_scan_timestamp = time.time()
                 if last_token: save_state({"startPageToken": last_token, "last_full_scan_timestamp": last_scan_timestamp})
-            else:
-                logging.critical("Initial workflow failed.")
-                return
+            else: return
 
         while True:
             try:
-                now = time.time()
-                if (now - last_scan_timestamp) > (SCHEDULED_RESCAN_HOURS * 3600):
-                    logging.info(f"Scheduled full rescan is due.")
+                if (time.time() - last_scan_timestamp) > (SCHEDULED_RESCAN_HOURS * 3600):
                     if run_full_scan_workflow(session):
-                        last_token = get_start_page_token(session, DRIVE_FOLDER_ID)
-                        last_scan_timestamp = time.time()
+                        last_token, last_scan_timestamp = get_start_page_token(session, DRIVE_FOLDER_ID), time.time()
                 else:
-                    logging.info("Checking for Drive changes...")
                     changes, new_token = list_changes(session, last_token, DRIVE_FOLDER_ID)
-
                     if new_token is None:
-                        logging.critical("Failed to fetch changes from Drive API. Retrying after long delay.")
-                        time.sleep(3600)
-                        continue
-
+                        time.sleep(3600); continue
                     if changes:
-                        ignored_files = ["drive_scan.jsonl", "matching_results.json", "drive_scan_last_run.jsonl", "matching_results_last_run.json"]
-                        relevant_changes = [c for c in changes if not (c.get('file') and c.get('file').get('name') in ignored_files)]
-                        
-                        if relevant_changes:
-                            if run_patch_workflow(session, relevant_changes):
-                                 last_token = new_token
-                        else:
-                            logging.info("All detected changes were for ignored files, no action needed.")
+                        if run_patch_workflow(session, changes):
                             last_token = new_token
                     else:
-                        logging.info("No changes detected.")
                         last_token = new_token
-
                 save_state({"startPageToken": last_token, "last_full_scan_timestamp": last_scan_timestamp})
-                logging.info(f"Sleeping for {POLLING_INTERVAL_SECONDS} seconds.")
                 time.sleep(POLLING_INTERVAL_SECONDS)
             except Exception as e:
                 logging.critical(f"Listener loop error: {e}", exc_info=True)
@@ -379,9 +372,7 @@ def main():
         logging.info("Listener shutting down. Uploading final log.")
         if logs_folder_id:
             backup_and_upload(session, LOG_FILE_PATH, logs_folder_id, NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
-            # Clear the local log file after successful upload
-            if LOG_FILE_PATH.exists():
-                open(LOG_FILE_PATH, 'w').close()
+            if LOG_FILE_PATH.exists(): open(LOG_FILE_PATH, 'w').close()
 
 if __name__ == "__main__":
     main()
