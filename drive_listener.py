@@ -194,10 +194,7 @@ def get_full_path(session, item_id, path_cache, root_name):
     if item_id in path_cache: return path_cache[item_id]
     item = get_item_metadata(session, item_id, fields="id,name,parents")
     if not item or not item.get('parents') or item['parents'][0] == DRIVE_FOLDER_ID:
-        if item:
-            path = f"{root_name}/{item.get('name', 'Unknown')}"
-        else:
-            path = f"{root_name}/Unknown"
+        path = f"{root_name}/{item['name']}" if item and 'name' in item else f"{root_name}/Unknown"
         path_cache[item_id] = path
         return path
     parent_path = get_full_path(session, item['parents'][0], path_cache, root_name)
@@ -217,7 +214,6 @@ def load_state():
     except Exception: return {}
 
 def check_for_new_report_and_trigger(session, state):
-    """Checks for an updated report file and triggers downstream scripts."""
     logging.info("Checking for new report file...")
     ntblm_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
     if not ntblm_folder: return state
@@ -229,7 +225,6 @@ def check_for_new_report_and_trigger(session, state):
     if not report_file_item: return state
 
     last_known_mod_time = state.get("last_report_modified_time")
-    # Add a check to ensure report_file_item is not None before accessing attributes
     current_mod_time = report_file_item.get("modifiedTime") if report_file_item else None
 
     if current_mod_time and current_mod_time != last_known_mod_time:
@@ -258,7 +253,6 @@ def run_full_scan_workflow(session):
     upload_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
     if upload_folder:
         backup_and_upload(session, local_scan_path, upload_folder['id'], NTBLM_DRIVE_ID, "drive_scan.jsonl", "drive_scan_last_run.jsonl")
-        # After a full scan, always trigger the downstream scripts
         logging.info("Full scan complete. Triggering matcher and planner.")
         os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'}")
         os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'}")
@@ -318,58 +312,59 @@ def main():
     session.mount("https://", adapter)
     
     ntblm_folder_id, logs_folder_id = None, None
-    try:
-        ntblm_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
-        if ntblm_folder:
-            ntblm_folder_id = ntblm_folder['id']
-            logs_folder_id = find_or_create_folder(session, LOGS_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
+    ntblm_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
+    if ntblm_folder:
+        ntblm_folder_id = ntblm_folder['id']
+        logs_folder_id = find_or_create_folder(session, LOGS_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
 
-        state = load_state()
-        if "last_report_modified_time" not in state:
-             # On first run, get current report time so we don't trigger immediately
-            state = check_for_new_report_and_trigger(session, {}) # Pass empty state to just get timestamp
+    state = load_state()
+    if "last_report_modified_time" not in state:
+        state = check_for_new_report_and_trigger(session, {})
+        save_state(state)
+
+    last_token, last_scan_timestamp = state.get("startPageToken"), state.get("last_full_scan_timestamp", 0)
+
+    if not last_token:
+        if run_full_scan_workflow(session):
+            last_token = get_start_page_token(session, DRIVE_FOLDER_ID)
+            state["startPageToken"] = last_token
+            state["last_full_scan_timestamp"] = time.time()
             save_state(state)
+        else: return
 
-        last_token, last_scan_timestamp = state.get("startPageToken"), state.get("last_full_scan_timestamp", 0)
-
-        if not last_token:
-            if run_full_scan_workflow(session):
-                last_token = get_start_page_token(session, DRIVE_FOLDER_ID)
-                state["startPageToken"] = last_token
-                state["last_full_scan_timestamp"] = time.time()
-                save_state(state)
-            else: return
-
-        while True:
-            try:
-                state = check_for_new_report_and_trigger(session, state)
-                
-                if (time.time() - state.get("last_full_scan_timestamp", 0)) > (SCHEDULED_RESCAN_HOURS * 3600):
-                    if run_full_scan_workflow(session):
-                        state["startPageToken"] = get_start_page_token(session, DRIVE_FOLDER_ID)
-                        state["last_full_scan_timestamp"] = time.time()
-                else:
-                    changes, new_token = list_changes(session, state.get("startPageToken"), DRIVE_FOLDER_ID)
-                    if new_token is None:
-                        time.sleep(3600); continue
-                    if changes:
-                        if run_patch_workflow(session, changes):
-                            state["startPageToken"] = new_token
-                    else:
-                        logging.info("No changes detected in main drive.")
+    while True:
+        try:
+            state = check_for_new_report_and_trigger(session, state)
+            
+            if (time.time() - state.get("last_full_scan_timestamp", 0)) > (SCHEDULED_RESCAN_HOURS * 3600):
+                if run_full_scan_workflow(session):
+                    state["startPageToken"] = get_start_page_token(session, DRIVE_FOLDER_ID)
+                    state["last_full_scan_timestamp"] = time.time()
+            else:
+                changes, new_token = list_changes(session, state.get("startPageToken"), DRIVE_FOLDER_ID)
+                if new_token is None:
+                    time.sleep(3600); continue
+                if changes:
+                    if run_patch_workflow(session, changes):
                         state["startPageToken"] = new_token
-                
-                save_state(state)
-                logging.info(f"Sleeping for {POLLING_INTERVAL_SECONDS} seconds.")
-                time.sleep(POLLING_INTERVAL_SECONDS)
-            except Exception as e:
-                logging.critical(f"Listener loop error: {e}", exc_info=True)
-                time.sleep(60)
-    finally:
-        logging.info("Listener shutting down. Uploading final log.")
-        if logs_folder_id:
-            backup_and_upload(session, LOG_FILE_PATH, logs_folder_id, NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
-            if LOG_FILE_PATH.exists(): open(LOG_FILE_PATH, 'w').close()
+                else:
+                    logging.info("No changes detected in main drive.")
+                    state["startPageToken"] = new_token
+            
+            save_state(state)
+            
+            # Upload logs at the end of each cycle
+            if logs_folder_id:
+                logging.info("Uploading current log file...")
+                backup_and_upload(session, LOG_FILE_PATH, logs_folder_id, NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
+                if LOG_FILE_PATH.exists():
+                    open(LOG_FILE_PATH, 'w').close()
+
+            logging.info(f"Sleeping for {POLLING_INTERVAL_SECONDS} seconds.")
+            time.sleep(POLLING_INTERVAL_SECONDS)
+        except Exception as e:
+            logging.critical(f"Listener loop error: {e}", exc_info=True)
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
