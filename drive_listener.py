@@ -194,7 +194,10 @@ def get_full_path(session, item_id, path_cache, root_name):
     if item_id in path_cache: return path_cache[item_id]
     item = get_item_metadata(session, item_id, fields="id,name,parents")
     if not item or not item.get('parents') or item['parents'][0] == DRIVE_FOLDER_ID:
-        path = f"{root_name}/{item.get('name', 'Unknown')}"
+        if item:
+            path = f"{root_name}/{item.get('name', 'Unknown')}"
+        else:
+            path = f"{root_name}/Unknown"
         path_cache[item_id] = path
         return path
     parent_path = get_full_path(session, item['parents'][0], path_cache, root_name)

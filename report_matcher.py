@@ -39,7 +39,7 @@ load_dotenv()
 DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID') 
 NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA"
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME', 'gemini-1.5-flash-latest')
+GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME')
 
 BASE_UPLOAD_FOLDER_NAME = "3-NTBLM"
 REPORTS_SUBFOLDER_NAME = "Reports"
@@ -49,8 +49,8 @@ CLIENTES_ATUAIS_NAME = "1. CLIENTES ATUAIS"
 CLIENTES_INATIVOS_NAME = "3. CLIENTES INATIVOS"
 DRIVE_API_V3_URL = "https://www.googleapis.com/drive/v3"
 
-if not (DRIVE_FOLDER_ID and GEMINI_API_KEY):
-    logging.critical("CRITICAL: DRIVE_FOLDER_ID or GEMINI_API_KEY not set in .env file. Exiting.")
+if not (DRIVE_FOLDER_ID and GEMINI_API_KEY and GEMINI_MODEL_NAME):
+    logging.critical("CRITICAL: DRIVE_FOLDER_ID, GEMINI_API_KEY, or GEMINI_MODEL_NAME not set in .env file. Exiting.")
     sys.exit(1)
 
 # --- Core Functions ---
@@ -139,8 +139,8 @@ def parse_report(file_path):
         return [], []
 
 def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_folders: list[dict]):
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+    genai.configure(api_key=GEMINI_API_KEY) # type: ignore
+    model = genai.GenerativeModel(GEMINI_MODEL_NAME) # type: ignore
     
     folder_list_str = "\n".join([f"- {item['name']}" for item in drive_folders])
     client_list_str = "\n".join([f"- {name}" for name in raw_client_names])
@@ -167,7 +167,15 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
     try:
         logging.info(f"Sending {len(drive_folders)} folders and {len(raw_client_names)} raw names to Gemini ({GEMINI_MODEL_NAME}) for consolidation and matching...")
         response = model.generate_content(prompt)
-        cleaned_response = re.search(r'```json\s*([\s\S]+?)\s*```', response.text, re.DOTALL).group(1)
+        
+        # Robustly find and parse the JSON block
+        match = re.search(r'```json\s*([\s\S]+?)\s*```', response.text, re.DOTALL)
+        if not match:
+            logging.error("AI response did not contain a valid JSON block.")
+            logging.error(f"Full AI Response: {response.text}")
+            return {}, {}
+            
+        cleaned_response = match.group(1)
         ai_results = json.loads(cleaned_response)
         
         consolidation_map = ai_results.get("consolidation_map", {})
@@ -273,7 +281,6 @@ def main():
     finally:
         if logs_folder_id:
             backup_and_upload(session, LOG_FILE_PATH, logs_folder_id, NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
-            # Clear the local log file after successful upload
             if LOG_FILE_PATH.exists():
                 open(LOG_FILE_PATH, 'w').close()
         
@@ -283,3 +290,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# --- End of report_matcher.py ---
