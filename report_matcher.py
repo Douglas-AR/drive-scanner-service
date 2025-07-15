@@ -41,6 +41,7 @@ DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
 NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA"
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME')
+AI_BATCH_SIZE = 100 # Number of clients to process per API call
 
 BASE_UPLOAD_FOLDER_NAME = "3-NTBLM"
 REPORTS_SUBFOLDER_NAME = "Reports"
@@ -148,67 +149,73 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
     model = genai.GenerativeModel(GEMINI_MODEL_NAME) # type: ignore
     
     folder_list_str = "\n".join([f"- {item['name']}" for item in drive_folders])
-    client_list_str = "\n".join([f"- {name}" for name in raw_client_names])
-
-    prompt = f"""
-    You are an expert file organization assistant for a Brazilian law firm. Your task is to perform a two-step analysis.
-    Here is a list of raw client names extracted directly from reports:
-    <Raw_Client_Names>
-    {client_list_str}
-    </Raw_Client_Names>
-
-    Here is the list of the official, second-level client folder names found on Google Drive:
-    <Drive_Folder_Names>
-    {folder_list_str}
-    </Drive_Folder_Names>
-
-    **Instructions:**
-    Step 1: Consolidate all names in <Raw_Client_Names> that refer to the same ultimate parent company into a single, clean "master name".
-    Step 2: Match each unique "master name" to the single best folder from <Drive_Folder_Names>.
-    Step 3: Return a single, valid JSON object with NO additional text or formatting. The JSON object must contain two keys:
-    1. "consolidation_map": A dictionary mapping every raw client name to its assigned "master name".
-    2. "match_map": A dictionary mapping each "master name" to its corresponding folder name from <Drive_Folder_Names> (or null if no match).
-    """
-    try:
-        logging.info(f"Sending {len(drive_folders)} folders and {len(raw_client_names)} new raw names to Gemini ({GEMINI_MODEL_NAME}) for consolidation and matching...")
+    
+    # --- Batch Processing Logic ---
+    all_consolidation_maps = {}
+    all_match_maps = {}
+    
+    for i in range(0, len(raw_client_names), AI_BATCH_SIZE):
+        batch_names = raw_client_names[i:i + AI_BATCH_SIZE]
+        logging.info(f"Processing batch {i//AI_BATCH_SIZE + 1} with {len(batch_names)} client names...")
         
-        # Define safety settings to be less restrictive
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
+        client_list_str = "\n".join([f"- {name}" for name in batch_names])
+        prompt = f"""
+        You are an expert file organization assistant for a Brazilian law firm. Your task is to perform a two-step analysis.
+        Here is a list of raw client names extracted directly from reports:
+        <Raw_Client_Names>
+        {client_list_str}
+        </Raw_Client_Names>
 
-        response = model.generate_content(prompt, safety_settings=safety_settings)
-        
-        # Check for blocked response before accessing .text
-        if not response.parts:
-            logging.error("AI response was blocked or empty.")
-            if response.prompt_feedback:
-                logging.error(f"Prompt Feedback: {response.prompt_feedback}")
-            return {}, {}
+        Here is the list of the official, second-level client folder names found on Google Drive:
+        <Drive_Folder_Names>
+        {folder_list_str}
+        </Drive_Folder_Names>
 
-        match = re.search(r'```json\s*([\s\S]+?)\s*```', response.text, re.DOTALL)
-        if not match:
-            logging.error("AI response did not contain a valid JSON block.")
-            logging.error(f"Full AI Response: {response.text}")
-            return {}, {}
+        **Instructions:**
+        Step 1: Consolidate all names in <Raw_Client_Names> that refer to the same ultimate parent company into a single, clean "master name".
+        Step 2: Match each unique "master name" to the single best folder from <Drive_Folder_Names>.
+        Step 3: Return a single, valid JSON object with NO additional text or formatting. The JSON object must contain two keys:
+        1. "consolidation_map": A dictionary mapping every raw client name to its assigned "master name".
+        2. "match_map": A dictionary mapping each "master name" to its corresponding folder name from <Drive_Folder_Names> (or null if no match).
+        """
+        try:
+            safety_settings = {
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+            }
+            response = model.generate_content(prompt, safety_settings=safety_settings)
             
-        cleaned_response = match.group(1)
-        ai_results = json.loads(cleaned_response)
+            if not response.parts:
+                logging.error(f"AI response for batch {i//AI_BATCH_SIZE + 1} was blocked or empty.")
+                if response.prompt_feedback: logging.error(f"Prompt Feedback: {response.prompt_feedback}")
+                continue # Skip to the next batch
+
+            match = re.search(r'```json\s*([\s\S]+?)\s*```', response.text, re.DOTALL)
+            if not match:
+                logging.error(f"AI response for batch {i//AI_BATCH_SIZE + 1} did not contain a valid JSON block.")
+                continue
+
+            cleaned_response = match.group(1)
+            ai_results = json.loads(cleaned_response)
+            
+            all_consolidation_maps.update(ai_results.get("consolidation_map", {}))
+            all_match_maps.update(ai_results.get("match_map", {}))
+
+        except Exception as e:
+            logging.error(f"AI matching failed for batch {i//AI_BATCH_SIZE + 1}: {e}", exc_info=True)
+            continue # Skip to the next batch
         
-        consolidation_map = ai_results.get("consolidation_map", {})
-        preliminary_match_map = ai_results.get("match_map", {})
-        
-        folder_lookup = {f['name']: f for f in drive_folders}
-        final_match_map = {master_name: folder_lookup.get(folder_name) for master_name, folder_name in preliminary_match_map.items()}
-        
-        logging.info("Successfully received and processed AI results for new clients.")
-        return consolidation_map, final_match_map
-    except Exception as e:
-        logging.error(f"AI matching failed: {e}", exc_info=True)
-        return {}, {}
+        time.sleep(1) # Add a small delay between API calls to avoid rate limiting
+
+    # --- Consolidate results from all batches ---
+    folder_lookup = {f['name']: f for f in drive_folders}
+    final_match_map = {master_name: folder_lookup.get(folder_name) for master_name, folder_name in all_match_maps.items()}
+    
+    logging.info("Successfully received and processed all AI batches.")
+    return all_consolidation_maps, final_match_map
+
 
 def generate_and_upload_client_trees(session, client_to_folder_map, scan_data, trees_folder_id, drive_id):
     logging.info("Generating and uploading client folder trees...")
