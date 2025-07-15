@@ -41,7 +41,7 @@ DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
 NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA"
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME')
-AI_BATCH_SIZE = 100 # Number of clients to process per API call
+AI_BATCH_SIZE = 100
 
 BASE_UPLOAD_FOLDER_NAME = "3-NTBLM"
 REPORTS_SUBFOLDER_NAME = "Reports"
@@ -150,7 +150,6 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
     
     folder_list_str = "\n".join([f"- {item['name']}" for item in drive_folders])
     
-    # --- Batch Processing Logic ---
     all_consolidation_maps = {}
     all_match_maps = {}
     
@@ -190,7 +189,7 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
             if not response.parts:
                 logging.error(f"AI response for batch {i//AI_BATCH_SIZE + 1} was blocked or empty.")
                 if response.prompt_feedback: logging.error(f"Prompt Feedback: {response.prompt_feedback}")
-                continue # Skip to the next batch
+                continue
 
             match = re.search(r'```json\s*([\s\S]+?)\s*```', response.text, re.DOTALL)
             if not match:
@@ -205,11 +204,10 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
 
         except Exception as e:
             logging.error(f"AI matching failed for batch {i//AI_BATCH_SIZE + 1}: {e}", exc_info=True)
-            continue # Skip to the next batch
+            continue
         
-        time.sleep(1) # Add a small delay between API calls to avoid rate limiting
+        time.sleep(1)
 
-    # --- Consolidate results from all batches ---
     folder_lookup = {f['name']: f for f in drive_folders}
     final_match_map = {master_name: folder_lookup.get(folder_name) for master_name, folder_name in all_match_maps.items()}
     
@@ -218,7 +216,7 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
 
 
 def generate_and_upload_client_trees(session, client_to_folder_map, scan_data, trees_folder_id, drive_id):
-    logging.info("Generating and uploading client folder trees...")
+    logging.info(f"Generating and uploading folder trees for {len(client_to_folder_map)} changed clients...")
     for master_name, folder_data in client_to_folder_map.items():
         if not folder_data: continue
         
@@ -252,6 +250,14 @@ def generate_and_upload_client_trees(session, client_to_folder_map, scan_data, t
         except Exception as e:
             logging.error(f"Failed to upload tree for '{master_name}': {e}")
 
+def get_client_file_signatures(scan_data, client_folder_map):
+    client_signatures = {}
+    for client_name, folder_info in client_folder_map.items():
+        if not folder_info: continue
+        client_folder_path = folder_info.get("path")
+        file_ids = {item['id'] for item in scan_data if item.get("path", "").startswith(client_folder_path)}
+        client_signatures[client_name] = file_ids
+    return client_signatures
 
 def main():
     logging.info(f"--- {APP_NAME} Started ---")
@@ -265,30 +271,36 @@ def main():
 
         ntblm_folder = find_drive_item(session, BASE_UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
         if not ntblm_folder:
-            return logging.critical(f"Could not find the base folder '{BASE_UPLOAD_FOLDER_NAME}' in the specified Drive. Exiting.")
+            return logging.critical(f"Could not find the base folder '{BASE_UPLOAD_FOLDER_NAME}'. Exiting.")
         
         ntblm_folder_id = ntblm_folder['id']
         logs_folder_id = find_or_create_folder(session, LOGS_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
         trees_folder_id = find_or_create_folder(session, MATCHED_TREES_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
         
-        # --- Load Current and Previous Data ---
-        scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
+        # --- Load all necessary files ---
+        current_scan_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
+        last_run_scan_item = find_drive_item(session, "drive_scan_last_run.jsonl", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
         last_match_item = find_drive_item(session, "matching_results_last_run.json", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
         reports_folder = find_drive_item(session, REPORTS_SUBFOLDER_NAME, parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
         report_file_item = find_drive_item(session, ".xlsx", parent_id=reports_folder['id'], drive_id=NTBLM_DRIVE_ID, order_by="modifiedTime desc") if reports_folder else None
         
-        if not (scan_file_item and report_file_item):
+        if not (current_scan_item and report_file_item):
             return logging.critical("Could not find necessary input files (current scan or report). Exiting.")
 
-        local_scan_path = TEMP_DIR / "drive_scan.jsonl"
+        local_current_scan_path = TEMP_DIR / "drive_scan.jsonl"
+        local_last_scan_path = TEMP_DIR / "drive_scan_last_run.jsonl"
         local_report_path = TEMP_DIR / report_file_item['name']
         local_last_match_path = TEMP_DIR / "matching_results_last_run.json"
         
-        download_file(session, scan_file_item['id'], local_scan_path)
+        download_file(session, current_scan_item['id'], local_current_scan_path)
         download_file(session, report_file_item['id'], local_report_path)
         
-        old_consolidation = {}
-        old_matches = {}
+        last_run_scan_data = []
+        if last_run_scan_item and download_file(session, last_run_scan_item['id'], local_last_scan_path):
+             with open(local_last_scan_path, 'r', encoding='utf-8') as f:
+                last_run_scan_data = [json.loads(line) for line in f if line.strip()]
+
+        old_consolidation, old_matches = {}, {}
         if last_match_item and download_file(session, last_match_item['id'], local_last_match_path):
             with open(local_last_match_path, 'r', encoding='utf-8') as f:
                 last_run_data = json.load(f)
@@ -296,20 +308,17 @@ def main():
             old_matches = last_run_data.get('client_to_folder_map', {})
             logging.info(f"Loaded {len(old_matches)} matches from the last run.")
 
-        with open(local_scan_path, 'r', encoding='utf-8') as f: scan_data = [json.loads(line) for line in f if line.strip()]
+        with open(local_current_scan_path, 'r', encoding='utf-8') as f: current_scan_data = [json.loads(line) for line in f if line.strip()]
         parsed_rows, raw_client_names = parse_report(local_report_path)
         
-        # --- Identify New Clients to Process ---
         new_clients_to_process = [name for name in raw_client_names if name not in old_consolidation]
         logging.info(f"Found {len(new_clients_to_process)} new client names to process from the report.")
 
-        root_name = next((item['name'] for item in scan_data if item['id'] == DRIVE_FOLDER_ID), "ROOT")
-        client_folders = [item for item in scan_data if item.get('indent') == 1 and (item.get('path','').startswith(f"{root_name}/{CLIENTES_ATUAIS_NAME}/") or item.get('path','').startswith(f"{root_name}/{CLIENTES_INATIVOS_NAME}/"))]
+        root_name = next((item['name'] for item in current_scan_data if item['id'] == DRIVE_FOLDER_ID), "ROOT")
+        client_folders = [item for item in current_scan_data if item.get('indent') == 1 and (item.get('path','').startswith(f"{root_name}/{CLIENTES_ATUAIS_NAME}/") or item.get('path','').startswith(f"{root_name}/{CLIENTES_INATIVOS_NAME}/"))]
 
-        # --- Process Only New Clients ---
         new_consolidation, new_matches = perform_ai_consolidation_and_matching(new_clients_to_process, client_folders)
 
-        # --- Merge Old and New Results ---
         final_consolidation = {**old_consolidation, **new_consolidation}
         final_matches = {**old_matches, **new_matches}
         
@@ -319,8 +328,20 @@ def main():
         
         backup_and_upload(session, local_match_path, ntblm_folder_id, NTBLM_DRIVE_ID, "matching_results.json", "matching_results_last_run.json")
         
+        # --- Identify clients that need tree updates and generate them ---
         if trees_folder_id:
-            generate_and_upload_client_trees(session, final_matches, scan_data, trees_folder_id, NTBLM_DRIVE_ID)
+            current_signatures = get_client_file_signatures(current_scan_data, final_matches)
+            last_run_signatures = get_client_file_signatures(last_run_scan_data, final_matches)
+            
+            clients_to_update_trees = {}
+            for client, current_files in current_signatures.items():
+                if current_files != last_run_signatures.get(client, set()):
+                    clients_to_update_trees[client] = final_matches[client]
+            
+            if clients_to_update_trees:
+                generate_and_upload_client_trees(session, clients_to_update_trees, current_scan_data, trees_folder_id, NTBLM_DRIVE_ID)
+            else:
+                logging.info("No client folder structures have changed. Skipping tree generation.")
 
     except Exception as e:
         logging.critical(f"A critical error occurred in the main process: {e}", exc_info=True)
