@@ -39,8 +39,8 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 # --- Load .env and Set Constants ---
 load_dotenv()
 DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
-NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA" # This is the ID for the "TI" Shared Drive
-UPLOAD_FOLDER_NAME = "3-NTBLM" # The folder to find inside the "TI" drive
+NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA"
+UPLOAD_FOLDER_NAME = "3-NTBLM"
 REPORTS_SUBFOLDER_NAME = "Reports"
 LOGS_SUBFOLDER_NAME = "Logs"
 POLLING_INTERVAL_SECONDS = 600
@@ -116,7 +116,7 @@ def backup_and_upload(session, local_path, folder_id, drive_id, current_filename
     except Exception as e:
         logging.error(f"Backup and upload failed for '{current_filename}': {e}")
 
-def get_item_metadata(session, item_id, fields="id,name,mimeType,parents,driveId,modifiedTime"):
+def get_item_metadata(session, item_id, fields="id,name,mimeType,parents,driveId,modifiedTime,size"):
     try:
         response = session.get(f"{DRIVE_API_V3_URL}/files/{item_id}", params={'fields': fields, 'supportsAllDrives': 'true'})
         response.raise_for_status()
@@ -144,7 +144,7 @@ def get_start_page_token(session, drive_id):
 
 def list_changes(session, page_token, drive_id):
     try:
-        params = {'driveId': drive_id, 'pageToken': page_token, 'fields': 'nextPageToken, newStartPageToken, changes(changeType,fileId,removed,file(parents,name,mimeType))', 'includeItemsFromAllDrives': True, 'supportsAllDrives': True}
+        params = {'driveId': drive_id, 'pageToken': page_token, 'fields': 'nextPageToken, newStartPageToken, changes(changeType,fileId,removed,file(parents,name,mimeType,size))', 'includeItemsFromAllDrives': True, 'supportsAllDrives': True}
         response = session.get(f"{DRIVE_API_V3_URL}/changes", params=params)
         response.raise_for_status()
         data = response.json()
@@ -157,7 +157,8 @@ def _scan_worker(session, folder_id, folder_path, indent, drive_id):
     files, folders = [], []
     next_page_token = None
     while True:
-        params = {'q': f"'{folder_id}' in parents and trashed=false", 'fields': "nextPageToken, files(id, name, mimeType)", 'supportsAllDrives': True, 'includeItemsFromAllDrives': True, 'pageSize': 1000}
+        # CORRECTED: Added 'size' to the fields requested from the API
+        params = {'q': f"'{folder_id}' in parents and trashed=false", 'fields': "nextPageToken, files(id, name, mimeType, size)", 'supportsAllDrives': True, 'includeItemsFromAllDrives': True, 'pageSize': 1000}
         if drive_id: params['corpora'] = 'drive'; params['driveId'] = drive_id
         if next_page_token: params['pageToken'] = next_page_token
         try:
