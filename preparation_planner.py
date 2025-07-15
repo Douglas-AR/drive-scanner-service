@@ -44,9 +44,8 @@ load_dotenv()
 NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA"
 BASE_UPLOAD_FOLDER_NAME = "3-NTBLM"
 LOGS_SUBFOLDER_NAME = "Logs"
-PREPARATION_PLANS_SUBFOLDER_NAME = "PreparationPlans" # New folder for individual plans
+PREPARATION_PLANS_SUBFOLDER_NAME = "PreparationPlans"
 DRIVE_API_V3_URL = "https://www.googleapis.com/drive/v3"
-NOTEBOOKLM_COMPATIBLE_MIMETYPES = ["application/pdf", "text/plain", "text/markdown", "audio/mpeg"]
 CONCATENATION_SIZE_LIMIT_MB = 190
 MAX_WORKERS = 10
 
@@ -119,7 +118,6 @@ def backup_and_upload(session, local_path, folder_id, drive_id, current_filename
         logging.error(f"Backup and upload failed for '{current_filename}': {e}")
 
 def upload_or_overwrite_file(session, local_path, folder_id, drive_id, drive_filename):
-    """Uploads a file, overwriting any existing file with the same name."""
     if not local_path.exists() or local_path.stat().st_size == 0:
         logging.info(f"Local file '{local_path.name}' is empty or missing. Skipping upload for '{drive_filename}'.")
         return
@@ -150,9 +148,16 @@ def get_task_for_file(file_info):
         "input_mime_type": mime_type,
         "estimated_size_bytes": int(file_info.get("size", 0))
     }
-    if mime_type in NOTEBOOKLM_COMPATIBLE_MIMETYPES:
+    
+    if mime_type == "application/pdf":
         task["task_type"] = "DIRECT_INCLUDE"
-        task["output_format"] = "native"
+        task["output_format"] = "pdf"
+    elif mime_type in ["text/plain", "text/markdown"]:
+        task["task_type"] = "DIRECT_INCLUDE"
+        task["output_format"] = "txt"
+    elif mime_type == "audio/mpeg":
+        task["task_type"] = "DIRECT_INCLUDE"
+        task["output_format"] = "mp3"
     elif "google-apps.document" in mime_type or "wordprocessingml" in mime_type:
         task["task_type"] = "CONVERT"
         task["output_format"] = "txt"
@@ -169,13 +174,10 @@ def get_task_for_file(file_info):
 
 def plan_concatenation(tasks):
     logging.info("Planning file concatenation...")
-    files_by_type = {"txt": [], "pdf": []}
+    files_by_type = {"txt": [], "pdf": [], "mp3": []}
     for task in tasks:
         if task["task_type"] == "IGNORE": continue
         output_format = task["output_format"]
-        if output_format == "native":
-            if "pdf" in task["input_mime_type"]: output_format = "pdf"
-            elif "text" in task["input_mime_type"]: output_format = "txt"
         if output_format in files_by_type:
             files_by_type[output_format].append(task)
 
@@ -197,6 +199,16 @@ def plan_concatenation(tasks):
     logging.info("Concatenation planning complete.")
     return concatenation_plan
 
+def get_client_file_signatures(scan_data, client_folder_map):
+    """Creates a dictionary mapping each client to a set of their file IDs for easy comparison."""
+    client_signatures = {}
+    for client_name, folder_info in client_folder_map.items():
+        if not folder_info: continue
+        client_folder_path = folder_info.get("path")
+        file_ids = {item['id'] for item in scan_data if item.get("path", "").startswith(client_folder_path)}
+        client_signatures[client_name] = file_ids
+    return client_signatures
+
 def main():
     logging.info(f"--- {APP_NAME} Started ---")
     session = AuthorizedSession(get_credentials())
@@ -210,40 +222,57 @@ def main():
         if not ntblm_folder:
             return logging.critical(f"Could not find the base folder '{BASE_UPLOAD_FOLDER_NAME}'. Exiting.")
         
-        # Create the main folder for all preparation plans
         plans_folder_id = find_or_create_folder(session, PREPARATION_PLANS_SUBFOLDER_NAME, ntblm_folder['id'], NTBLM_DRIVE_ID)
         if not plans_folder_id:
             return logging.critical(f"Could not create the '{PREPARATION_PLANS_SUBFOLDER_NAME}' folder. Exiting.")
 
+        # --- Load all necessary files ---
         matcher_results_item = find_drive_item(session, "matching_results.json", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
-        scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
-        if not (matcher_results_item and scan_file_item):
+        current_scan_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
+        last_run_scan_item = find_drive_item(session, "drive_scan_last_run.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
+        
+        if not (matcher_results_item and current_scan_item):
             return logging.critical("Could not find 'matching_results.json' or 'drive_scan.jsonl'. Exiting.")
 
         local_matcher_path = TEMP_DIR / "matching_results.json"
-        local_scan_path = TEMP_DIR / "drive_scan.jsonl"
-        download_file(session, matcher_results_item['id'], local_matcher_path)
-        download_file(session, scan_file_item['id'], local_scan_path)
-
-        with open(local_matcher_path, 'r', encoding='utf-8') as f: matcher_data = json.load(f)
-        with open(local_scan_path, 'r', encoding='utf-8') as f: scan_data = [json.loads(line) for line in f if line.strip()]
-
-        all_matched_clients = [name for name, folder in matcher_data.get("client_to_folder_map", {}).items() if folder]
-        if not all_matched_clients:
-            return logging.info("No matched clients found to plan for. Exiting.")
+        local_current_scan_path = TEMP_DIR / "drive_scan.jsonl"
+        local_last_scan_path = TEMP_DIR / "drive_scan_last_run.jsonl"
         
-        logging.info(f"Starting to generate individual plans for {len(all_matched_clients)} clients.")
+        download_file(session, matcher_results_item['id'], local_matcher_path)
+        download_file(session, current_scan_item['id'], local_current_scan_path)
+        
+        with open(local_matcher_path, 'r', encoding='utf-8') as f: matcher_data = json.load(f)
+        with open(local_current_scan_path, 'r', encoding='utf-8') as f: current_scan_data = [json.loads(line) for line in f if line.strip()]
+        
+        last_run_scan_data = []
+        if last_run_scan_item and download_file(session, last_run_scan_item['id'], local_last_scan_path):
+            with open(local_last_scan_path, 'r', encoding='utf-8') as f:
+                last_run_scan_data = [json.loads(line) for line in f if line.strip()]
+        
+        # --- Identify clients that need a new plan ---
         client_folder_map = matcher_data.get("client_to_folder_map", {})
+        current_signatures = get_client_file_signatures(current_scan_data, client_folder_map)
+        last_run_signatures = get_client_file_signatures(last_run_scan_data, client_folder_map)
+        
+        clients_to_replan = []
+        for client, current_files in current_signatures.items():
+            last_files = last_run_signatures.get(client, set())
+            if current_files != last_files:
+                clients_to_replan.append(client)
+        
+        if not clients_to_replan:
+            return logging.info("No client folders have changed. No new plans needed.")
+            
+        logging.info(f"Found changes for {len(clients_to_replan)} clients. Generating new plans...")
 
-        for client_name in all_matched_clients:
+        # --- Generate plans only for changed clients ---
+        for client_name in clients_to_replan:
             logging.info(f"--- Planning for client: {client_name} ---")
             client_folder_info = client_folder_map.get(client_name)
-            if not client_folder_info:
-                logging.warning(f"Skipping client '{client_name}' as no folder info was found.")
-                continue
+            if not client_folder_info: continue
             
             client_folder_path = client_folder_info.get("path")
-            client_files = [item for item in scan_data if item.get("path", "").startswith(client_folder_path)]
+            client_files = [item for item in current_scan_data if item.get("path", "").startswith(client_folder_path)]
             
             for file_info in client_files:
                 file_info["client_master_name"] = client_name
