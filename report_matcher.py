@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 import time
 import shutil
+from datetime import datetime
 
 import requests
 import pandas as pd
@@ -28,22 +29,22 @@ TEMP_DIR = BASE_DIR / "temp_files" / "matcher_run"
 # --- Logging Setup ---
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s', handlers=[logging.FileHandler(LOG_DIR / f"{APP_NAME}.log"), logging.StreamHandler(sys.stdout)])
+LOG_FILE_PATH = LOG_DIR / f"{APP_NAME}.log"
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s', handlers=[logging.FileHandler(LOG_FILE_PATH), logging.StreamHandler(sys.stdout)])
 logging.getLogger("googleapiclient").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # --- Load .env and Set Constants ---
 load_dotenv()
-# ID of the Shared Drive to be SCANNED (used for context, not primary target)
 DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID') 
-# ID of the Shared Drive where the NTBLM folder is located
 NTBLM_DRIVE_ID = "0APlttYcHDqnvUk9PVA"
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_MODEL_NAME = os.getenv('GEMINI_MODEL_NAME', 'gemini-1.5-flash-latest')
 
-# Name of the folder where input/output files are stored
 BASE_UPLOAD_FOLDER_NAME = "3-NTBLM"
 REPORTS_SUBFOLDER_NAME = "Reports"
+LOGS_SUBFOLDER_NAME = "Logs"
+MATCHED_TREES_SUBFOLDER_NAME = "MatchedClientTrees"
 CLIENTES_ATUAIS_NAME = "1. CLIENTES ATUAIS"
 CLIENTES_INATIVOS_NAME = "3. CLIENTES INATIVOS"
 DRIVE_API_V3_URL = "https://www.googleapis.com/drive/v3"
@@ -53,30 +54,23 @@ if not (DRIVE_FOLDER_ID and GEMINI_API_KEY):
     sys.exit(1)
 
 # --- Core Functions ---
-
 def get_credentials():
     scopes = ['https://www.googleapis.com/auth/drive']
     try:
         creds = service_account.Credentials.from_service_account_file(str(SERVICE_ACCOUNT_KEY_PATH), scopes=scopes)
         return creds
     except Exception as e:
-        logging.critical(f"Failed to load service account credentials: {e}", exc_info=True)
+        logging.critical(f"Failed to load credentials: {e}", exc_info=True)
         sys.exit(1)
 
 def find_drive_item(session, name, parent_id=None, drive_id=None, mime_type=None, order_by=None):
     safe_name = name.replace("'", "\\'")
-    if name.startswith("."):
-        query_parts = [f"name contains '{safe_name}'", "trashed = false"]
-    else:
-        query_parts = [f"name = '{safe_name}'", "trashed = false"]
-
+    query_parts = [f"name = '{safe_name}'" if not name.startswith(".") else f"name contains '{safe_name}'", "trashed = false"]
     if parent_id: query_parts.append(f"'{parent_id}' in parents")
     if mime_type: query_parts.append(f"mimeType = '{mime_type}'")
-    
     params = {'q': " and ".join(query_parts), 'fields': 'files(id, name, modifiedTime)', 'supportsAllDrives': True, 'includeItemsFromAllDrives': True}
     if drive_id: params['driveId'] = drive_id; params['corpora'] = 'drive'
     if order_by: params['orderBy'] = order_by
-
     try:
         response = session.get(f"{DRIVE_API_V3_URL}/files", params=params)
         response.raise_for_status()
@@ -85,6 +79,42 @@ def find_drive_item(session, name, parent_id=None, drive_id=None, mime_type=None
     except Exception as e:
         logging.error(f"Error finding item '{name}': {e}")
         return None
+
+def find_or_create_folder(session, folder_name, parent_id, drive_id):
+    folder = find_drive_item(session, folder_name, parent_id=parent_id, drive_id=drive_id)
+    if folder: return folder['id']
+    try:
+        file_metadata = {'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
+        response = session.post(f"{DRIVE_API_V3_URL}/files", json=file_metadata, params={'supportsAllDrives': 'true'})
+        response.raise_for_status()
+        logging.info(f"Created folder '{folder_name}'.")
+        return response.json()['id']
+    except Exception as e:
+        logging.error(f"Failed to create folder '{folder_name}': {e}")
+        return None
+
+def backup_and_upload(session, local_path, folder_id, drive_id, current_filename, backup_filename):
+    if not local_path.exists() or local_path.stat().st_size == 0:
+        logging.info(f"Local file '{local_path.name}' is empty or missing. Skipping upload for '{current_filename}'.")
+        return
+    try:
+        existing_file = find_drive_item(session, current_filename, parent_id=folder_id, drive_id=drive_id)
+        if existing_file:
+            old_backup = find_drive_item(session, backup_filename, parent_id=folder_id, drive_id=drive_id)
+            if old_backup:
+                session.delete(f"{DRIVE_API_V3_URL}/files/{old_backup['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
+            update_metadata = {'name': backup_filename}
+            session.patch(f"{DRIVE_API_V3_URL}/files/{existing_file['id']}", json=update_metadata, params={'supportsAllDrives': 'true'}).raise_for_status()
+            logging.info(f"Backed up '{current_filename}' to '{backup_filename}'.")
+        
+        file_metadata = {'name': current_filename, 'parents': [folder_id]}
+        with open(local_path, 'rb') as f:
+            files = {'data': ('metadata', json.dumps(file_metadata), 'application/json'), 'file': f}
+            response = session.post(f"https://www.googleapis.com/upload/drive/v3/files", params={'uploadType': 'multipart', 'supportsAllDrives': 'true'}, files=files)
+            response.raise_for_status()
+        logging.info(f"Successfully uploaded new '{current_filename}'.")
+    except Exception as e:
+        logging.error(f"Backup and upload failed for '{current_filename}': {e}")
 
 def download_file(session, file_id, destination_path):
     try:
@@ -95,49 +125,18 @@ def download_file(session, file_id, destination_path):
         return True
     except Exception: return False
 
-def upload_file(session, local_path, folder_id, drive_filename):
-    try:
-        existing = find_drive_item(session, drive_filename, parent_id=folder_id, drive_id=NTBLM_DRIVE_ID)
-        if existing:
-            session.delete(f"{DRIVE_API_V3_URL}/files/{existing['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
-        
-        file_metadata = {'name': drive_filename, 'parents': [folder_id]}
-        with open(local_path, 'rb') as f:
-            files = {'data': ('metadata', json.dumps(file_metadata), 'application/json'), 'file': f}
-            response = session.post(f"https://www.googleapis.com/upload/drive/v3/files", params={'uploadType': 'multipart', 'supportsAllDrives': 'true'}, files=files)
-            response.raise_for_status()
-    except Exception as e:
-        logging.error(f"Upload failed for '{drive_filename}': {e}")
-
 def parse_report(file_path):
-    """
-    Parses the report file, using the 4th column for client names
-    while preserving the original headers in the output.
-    """
     try:
-        # Read the file, assuming the first row is the header
         df = pd.read_excel(file_path, dtype=str).fillna('')
-        
-        # Check if there are enough columns
         if df.shape[1] <= 3:
-            logging.error(f"Report file has fewer than 4 columns. Cannot identify client column.")
             return [], []
-
-        # Identify the name of the 4th column (index 3)
         client_col_name = df.columns[3]
-        logging.info(f"Using the 4th column ('{client_col_name}') as the client name column.")
-
-        # Convert the DataFrame to a list of dictionaries with original headers
         all_rows = df.to_dict('records')
-
-        # Extract the unique client names from the identified column
         raw_client_names = list(df[client_col_name].str.strip().dropna().unique())
-
         return all_rows, raw_client_names
     except Exception as e:
         logging.error(f"Failed to parse report {file_path}: {e}", exc_info=True)
         return [], []
-
 
 def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_folders: list[dict]):
     genai.configure(api_key=GEMINI_API_KEY)
@@ -183,53 +182,104 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
         logging.error(f"AI matching failed: {e}", exc_info=True)
         return {}, {}
 
+def generate_and_upload_client_trees(session, client_to_folder_map, scan_data, trees_folder_id, drive_id):
+    logging.info("Generating and uploading client folder trees...")
+    for master_name, folder_data in client_to_folder_map.items():
+        if not folder_data: continue
+        
+        client_folder_path = folder_data.get('path')
+        if not client_folder_path: continue
+
+        tree_items = [item for item in scan_data if item.get('path', '').startswith(client_folder_path)]
+        
+        tree_text = f"File tree for: {master_name}\n"
+        tree_text += "=" * (len(tree_text) - 1) + "\n"
+        for item in sorted(tree_items, key=lambda x: x.get('path', '')):
+            indent = item.get('indent', 0)
+            prefix = '  ' * (indent - 1) + '|- ' if indent > 0 else ''
+            tree_text += f"{prefix}{item.get('name', 'Unknown')}\n"
+        
+        safe_filename = "".join(c for c in master_name if c.isalnum() or c in (' ', '_')).rstrip()
+        local_tree_path = TEMP_DIR / f"{safe_filename}_tree.txt"
+        with open(local_tree_path, 'w', encoding='utf-8') as f:
+            f.write(tree_text)
+        
+        try:
+            existing = find_drive_item(session, f"{safe_filename}_tree.txt", parent_id=trees_folder_id, drive_id=drive_id)
+            if existing:
+                session.delete(f"{DRIVE_API_V3_URL}/files/{existing['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
+            
+            file_metadata = {'name': f"{safe_filename}_tree.txt", 'parents': [trees_folder_id]}
+            with open(local_tree_path, 'rb') as f:
+                files = {'data': ('metadata', json.dumps(file_metadata), 'application/json'), 'file': f}
+                session.post(f"https://www.googleapis.com/upload/drive/v3/files", params={'uploadType': 'multipart', 'supportsAllDrives': 'true'}, files=files).raise_for_status()
+            logging.info(f"Uploaded tree for '{master_name}'.")
+        except Exception as e:
+            logging.error(f"Failed to upload tree for '{master_name}': {e}")
+
+
 def main():
     logging.info(f"--- {APP_NAME} Started ---")
     session = AuthorizedSession(get_credentials())
     adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=Retry(total=5, backoff_factor=1))
     session.mount("https://", adapter)
     
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    logs_folder_id = None
+    try:
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    ntblm_folder, scan_file_item, report_file_item = None, None, None
-    for attempt in range(3):
-        # Find the base folder in the correct Shared Drive
         ntblm_folder = find_drive_item(session, BASE_UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
-        if ntblm_folder:
-            # Find the other files inside it
-            scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
-            reports_folder = find_drive_item(session, REPORTS_SUBFOLDER_NAME, parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
-            if reports_folder:
-                report_file_item = find_drive_item(session, ".xlsx", parent_id=reports_folder['id'], drive_id=NTBLM_DRIVE_ID, order_by="modifiedTime desc")
+        if not ntblm_folder:
+            return logging.critical(f"Could not find the base folder '{BASE_UPLOAD_FOLDER_NAME}' in the specified Drive. Exiting.")
         
-        if scan_file_item and report_file_item: break
-        logging.warning(f"Attempt {attempt+1}/3: Critical input files not found. Retrying in 10 seconds...")
-        time.sleep(10)
-    
-    if not (scan_file_item and report_file_item):
-        return logging.critical("Could not find necessary input files on Drive after multiple retries. Exiting.")
+        ntblm_folder_id = ntblm_folder['id']
+        logs_folder_id = find_or_create_folder(session, LOGS_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
+        trees_folder_id = find_or_create_folder(session, MATCHED_TREES_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
+        
+        scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID) or \
+                         find_drive_item(session, "drive_scan_last_run.jsonl", parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
+        
+        reports_folder = find_drive_item(session, REPORTS_SUBFOLDER_NAME, parent_id=ntblm_folder_id, drive_id=NTBLM_DRIVE_ID)
+        report_file_item = find_drive_item(session, ".xlsx", parent_id=reports_folder['id'], drive_id=NTBLM_DRIVE_ID, order_by="modifiedTime desc") if reports_folder else None
+        
+        if not (scan_file_item and report_file_item):
+            return logging.critical("Could not find necessary input files (scan or report). Exiting.")
 
-    local_scan_path = TEMP_DIR / "drive_scan.jsonl"
-    local_report_path = TEMP_DIR / report_file_item['name']
-    
-    if not (download_file(session, scan_file_item['id'], local_scan_path) and download_file(session, report_file_item['id'], local_report_path)):
-        return logging.critical("Failed to download necessary input files. Exiting.")
+        local_scan_path = TEMP_DIR / "drive_scan.jsonl"
+        local_report_path = TEMP_DIR / report_file_item['name']
+        
+        if not (download_file(session, scan_file_item['id'], local_scan_path) and download_file(session, report_file_item['id'], local_report_path)):
+            return logging.critical("Failed to download necessary input files. Exiting.")
 
-    with open(local_scan_path, 'r', encoding='utf-8') as f: scan_data = [json.loads(line) for line in f if line.strip()]
-    parsed_rows, raw_client_names = parse_report(local_report_path)
-    
-    root_name = next((item['name'] for item in scan_data if item['id'] == DRIVE_FOLDER_ID), "ROOT")
-    client_folders = [item for item in scan_data if item.get('indent') == 1 and (item.get('path','').startswith(f"{root_name}/{CLIENTES_ATUAIS_NAME}/") or item.get('path','').startswith(f"{root_name}/{CLIENTES_INATIVOS_NAME}/"))]
+        with open(local_scan_path, 'r', encoding='utf-8') as f: scan_data = [json.loads(line) for line in f if line.strip()]
+        parsed_rows, raw_client_names = parse_report(local_report_path)
+        
+        root_name = next((item['name'] for item in scan_data if item['id'] == DRIVE_FOLDER_ID), "ROOT")
+        client_folders = [item for item in scan_data if item.get('indent') == 1 and (item.get('path','').startswith(f"{root_name}/{CLIENTES_ATUAIS_NAME}/") or item.get('path','').startswith(f"{root_name}/{CLIENTES_INATIVOS_NAME}/"))]
 
-    consolidation_map, client_to_folder_map = perform_ai_consolidation_and_matching(raw_client_names, client_folders)
-    
-    results_to_save = {'client_to_folder_map': client_to_folder_map, 'report_client_consolidation_map': consolidation_map, 'all_parsed_report_rows': parsed_rows}
-    local_match_path = TEMP_DIR / "matching_results.json"
-    with open(local_match_path, 'w', encoding='utf-8') as f: json.dump(results_to_save, f, indent=2, ensure_ascii=False)
-    upload_file(session, local_match_path, ntblm_folder['id'], "matching_results.json")
-    
-    shutil.rmtree(TEMP_DIR)
-    logging.info(f"{APP_NAME} finished successfully.")
+        consolidation_map, client_to_folder_map = perform_ai_consolidation_and_matching(raw_client_names, client_folders)
+        
+        results_to_save = {'client_to_folder_map': client_to_folder_map, 'report_client_consolidation_map': consolidation_map, 'all_parsed_report_rows': parsed_rows}
+        local_match_path = TEMP_DIR / "matching_results.json"
+        with open(local_match_path, 'w', encoding='utf-8') as f: json.dump(results_to_save, f, indent=2, ensure_ascii=False)
+        
+        backup_and_upload(session, local_match_path, ntblm_folder_id, NTBLM_DRIVE_ID, "matching_results.json", "matching_results_last_run.json")
+        
+        if trees_folder_id:
+            generate_and_upload_client_trees(session, client_to_folder_map, scan_data, trees_folder_id, NTBLM_DRIVE_ID)
+
+    except Exception as e:
+        logging.critical(f"A critical error occurred in the main process: {e}", exc_info=True)
+    finally:
+        if logs_folder_id:
+            backup_and_upload(session, LOG_FILE_PATH, logs_folder_id, NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
+            # Clear the local log file after successful upload
+            if LOG_FILE_PATH.exists():
+                open(LOG_FILE_PATH, 'w').close()
+        
+        if TEMP_DIR.exists():
+            shutil.rmtree(TEMP_DIR)
+        logging.info(f"{APP_NAME} finished.")
 
 if __name__ == "__main__":
     main()
