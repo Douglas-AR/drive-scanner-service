@@ -47,7 +47,7 @@ BASE_UPLOAD_FOLDER_NAME = "3-NTBLM"
 LOGS_SUBFOLDER_NAME = "Logs"
 PREPARATION_PLANS_SUBFOLDER_NAME = "PreparationPlans"
 DRIVE_API_V3_URL = "https://www.googleapis.com/drive/v3"
-CONCATENATION_SIZE_LIMIT_MB = 190
+CONCATENATION_SIZE_LIMIT_MB = 150
 MAX_WORKERS = 10
 
 # --- Core Functions ---
@@ -289,21 +289,26 @@ def main(args):
         
         # --- Identify clients that need a new plan ---
         client_to_folders_map = matcher_data.get("client_to_folders_map", {})
-        current_signatures = get_client_file_signatures(current_scan_data, client_to_folders_map)
-        last_run_signatures = get_client_file_signatures(last_run_scan_data, client_to_folders_map)
         
         clients_to_replan = []
-        for client, current_files in current_signatures.items():
-            last_files = last_run_signatures.get(client, set())
-            if current_files != last_files:
-                clients_to_replan.append(client)
+        if args.full_run:
+            logging.info("FULL RUN mode: All clients will be replanned.")
+            clients_to_replan = list(client_to_folders_map.keys())
+        else:
+            current_signatures = get_client_file_signatures(current_scan_data, client_to_folders_map)
+            last_run_signatures = get_client_file_signatures(last_run_scan_data, client_to_folders_map)
+            
+            for client, current_files in current_signatures.items():
+                last_files = last_run_signatures.get(client, set())
+                if current_files != last_files:
+                    clients_to_replan.append(client)
         
         if not clients_to_replan:
-            return logging.info("No client folders have changed. No new plans needed.")
+            return logging.info("No clients require plan generation.")
             
-        logging.info(f"Found changes for {len(clients_to_replan)} clients. Generating new plans...")
+        logging.info(f"Found {len(clients_to_replan)} clients to generate plans for. Generating new plans...")
 
-        # --- Generate plans only for changed clients ---
+        # --- Generate plans only for identified clients ---
         for client_name in clients_to_replan:
             logging.info(f"--- Planning for client: {client_name} ---")
             client_folder_info_list = client_to_folders_map.get(client_name)
@@ -314,6 +319,9 @@ def main(args):
             for path in client_folder_paths:
                 client_files.extend([item for item in current_scan_data if item.get("path", "").startswith(path)])
             
+            # Deduplicate files in case of overlapping folder paths
+            client_files = list({f['id']: f for f in client_files}.values())
+
             for file_info in client_files:
                 file_info["client_master_name"] = client_name
             

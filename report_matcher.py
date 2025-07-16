@@ -168,8 +168,8 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
         logging.info("No new client names to process.")
         return {}, {}
         
-    genai.configure(api_key=GEMINI_API_KEY) # type: ignore
-    model = genai.GenerativeModel(GEMINI_MODEL_NAME)  #type: ignore
+    genai.configure(api_key=GEMINI_API_KEY)  # type: ignore
+    model = genai.GenerativeModel(GEMINI_MODEL_NAME) # type: ignore
     
     folder_list_str = "\n".join([f"- {item['name']}" for item in drive_folders])
     
@@ -239,7 +239,7 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
 
 
 def generate_and_upload_client_trees(session, client_to_folders_map, scan_data, trees_folder_id, drive_id):
-    logging.info(f"Generating and uploading folder trees for {len(client_to_folders_map)} changed clients...")
+    logging.info(f"Generating and uploading folder trees for {len(client_to_folders_map)} clients...")
     for master_name, folder_data_list in client_to_folders_map.items():
         if not folder_data_list: continue
         
@@ -407,14 +407,18 @@ def main(args):
         
         # --- Identify clients that need tree updates and generate them ---
         if trees_folder_id:
-            current_signatures = get_client_file_signatures(current_scan_data, final_matches)
-            last_run_signatures = get_client_file_signatures(last_run_scan_data, final_matches)
-            
             clients_to_update_trees = {}
-            for client, current_files in current_signatures.items():
-                if current_files != last_run_signatures.get(client, set()):
-                    clients_to_update_trees[client] = final_matches[client]
-            
+            if args.full_run:
+                logging.info("FULL RUN mode: All client trees will be regenerated.")
+                clients_to_update_trees = final_matches
+            else:
+                current_signatures = get_client_file_signatures(current_scan_data, final_matches)
+                last_run_signatures = get_client_file_signatures(last_run_scan_data, final_matches)
+                
+                for client, current_files in current_signatures.items():
+                    if current_files != last_run_signatures.get(client, set()):
+                        clients_to_update_trees[client] = final_matches[client]
+
             if clients_to_update_trees:
                 generate_and_upload_client_trees(session, clients_to_update_trees, current_scan_data, trees_folder_id, NTBLM_DRIVE_ID)
             else:
