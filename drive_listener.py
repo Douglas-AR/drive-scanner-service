@@ -5,7 +5,7 @@ import sys
 import json
 import logging
 import time
-import re
+import argparse
 from pathlib import Path
 from collections import deque
 import concurrent.futures
@@ -157,8 +157,7 @@ def _scan_worker(session, folder_id, folder_path, indent, drive_id):
     files, folders = [], []
     next_page_token = None
     while True:
-        # CORRECTED: Added 'size' to the fields requested from the API
-        params = {'q': f"'{folder_id}' in parents and trashed=false", 'fields': "nextPageToken, files(id, name, mimeType, size)", 'supportsAllDrives': True, 'includeItemsFromAllDrives': True, 'pageSize': 1000}
+        params = {'q': f"'{folder_id}' in parents and trashed=false", 'fields': "nextPageToken, files(id, name, mimeType, size, parents)", 'supportsAllDrives': True, 'includeItemsFromAllDrives': True, 'pageSize': 1000}
         if drive_id: params['corpora'] = 'drive'; params['driveId'] = drive_id
         if next_page_token: params['pageToken'] = next_page_token
         try:
@@ -213,7 +212,7 @@ def load_state():
         with open(STATE_FILE, 'r') as f: return json.load(f)
     except Exception: return {}
 
-def check_for_new_report_and_trigger(session, state):
+def check_for_new_report_and_trigger(session, state, full_run=False):
     logging.info("Checking for new report file...")
     ntblm_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
     if not ntblm_folder: return state
@@ -227,17 +226,21 @@ def check_for_new_report_and_trigger(session, state):
     last_known_mod_time = state.get("last_report_modified_time")
     current_mod_time = report_file_item.get("modifiedTime") if report_file_item else None
 
-    if current_mod_time and current_mod_time != last_known_mod_time:
-        logging.info(f"New report file detected (Modified: {current_mod_time}). Triggering matcher and planner.")
-        os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'}")
-        os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'}")
+    if full_run or (current_mod_time and current_mod_time != last_known_mod_time):
+        trigger_reason = "Full run requested" if full_run else f"New report file detected (Modified: {current_mod_time})"
+        logging.info(f"{trigger_reason}. Triggering matcher and planner.")
+        
+        full_run_flag = "--full-run" if full_run else ""
+        os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'} {full_run_flag}")
+        os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'} {full_run_flag}")
+        
         state["last_report_modified_time"] = current_mod_time
     else:
         logging.info("Report file has not changed.")
     
     return state
 
-def run_full_scan_workflow(session):
+def run_full_scan_workflow(session, full_run=False):
     logging.info("Starting FULL scan workflow...")
     root_meta = get_item_metadata(session, DRIVE_FOLDER_ID)
     if not root_meta: return False
@@ -254,8 +257,10 @@ def run_full_scan_workflow(session):
     if upload_folder:
         backup_and_upload(session, local_scan_path, upload_folder['id'], NTBLM_DRIVE_ID, "drive_scan.jsonl", "drive_scan_last_run.jsonl")
         logging.info("Full scan complete. Triggering matcher and planner.")
-        os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'}")
-        os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'}")
+        
+        full_run_flag = "--full-run" if full_run else ""
+        os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'} {full_run_flag}")
+        os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'} {full_run_flag}")
     else:
         logging.error(f"Could not find the upload folder '{UPLOAD_FOLDER_NAME}' in the specified NTBLM drive.")
 
@@ -306,7 +311,7 @@ def run_patch_workflow(session, changes):
         logging.error(f"Error during PATCH workflow: {e}. Falling back to full scan.")
         return run_full_scan_workflow(session)
 
-def main():
+def main(args):
     session = AuthorizedSession(get_credentials())
     adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 503]))
     session.mount("https://", adapter)
@@ -317,20 +322,32 @@ def main():
         ntblm_folder_id = ntblm_folder['id']
         logs_folder_id = find_or_create_folder(session, LOGS_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
 
-    state = load_state()
+    if args.full_run:
+        logging.info("--- FULL RUN initiated by command line ---")
+        if STATE_FILE.exists():
+            logging.info(f"Deleting state file: {STATE_FILE}")
+            STATE_FILE.unlink()
+        state = {}
+    else:
+        state = load_state()
+
     if "last_report_modified_time" not in state:
-        state = check_for_new_report_and_trigger(session, {})
+        state = check_for_new_report_and_trigger(session, {}, full_run=args.full_run)
         save_state(state)
 
     last_token, last_scan_timestamp = state.get("startPageToken"), state.get("last_full_scan_timestamp", 0)
 
-    if not last_token:
-        if run_full_scan_workflow(session):
+    if args.full_run or not last_token:
+        if run_full_scan_workflow(session, full_run=args.full_run):
             last_token = get_start_page_token(session, DRIVE_FOLDER_ID)
             state["startPageToken"] = last_token
             state["last_full_scan_timestamp"] = time.time()
             save_state(state)
         else: return
+        # If it was a full run, we can exit after the first cycle.
+        if args.full_run:
+            logging.info("Full run cycle complete. Exiting.")
+            return
 
     while True:
         try:
@@ -343,6 +360,7 @@ def main():
             else:
                 changes, new_token = list_changes(session, state.get("startPageToken"), DRIVE_FOLDER_ID)
                 if new_token is None:
+                    logging.warning("Failed to get new page token. Retrying in 1 hour.")
                     time.sleep(3600); continue
                 if changes:
                     if run_patch_workflow(session, changes):
@@ -353,7 +371,6 @@ def main():
             
             save_state(state)
             
-            # Upload logs at the end of each cycle
             if logs_folder_id:
                 logging.info("Uploading current log file...")
                 backup_and_upload(session, LOG_FILE_PATH, logs_folder_id, NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
@@ -367,4 +384,7 @@ def main():
             time.sleep(60)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Google Drive Listener and Scanner Service.")
+    parser.add_argument("--full-run", action="store_true", help="Perform a full, clean run, ignoring all saved states.")
+    cli_args = parser.parse_args()
+    main(cli_args)

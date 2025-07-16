@@ -5,10 +5,12 @@ import sys
 import json
 import logging
 import re
+import argparse
 from pathlib import Path
 import time
 import shutil
 from datetime import datetime
+from collections import defaultdict
 
 import requests
 import pandas as pd
@@ -127,6 +129,27 @@ def download_file(session, file_id, destination_path):
         return True
     except Exception: return False
 
+def cleanup_drive_outputs(session, ntblm_folder_id, drive_id):
+    logging.warning("--- FULL RUN: Cleaning up previous outputs on Google Drive. ---")
+    files_to_delete = ["matching_results.json", "matching_results_last_run.json"]
+    for filename in files_to_delete:
+        item = find_drive_item(session, filename, parent_id=ntblm_folder_id, drive_id=drive_id)
+        if item:
+            try:
+                session.delete(f"{DRIVE_API_V3_URL}/files/{item['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
+                logging.info(f"Deleted '{filename}' from Drive.")
+            except Exception as e:
+                logging.error(f"Failed to delete '{filename}' from Drive: {e}")
+
+    trees_folder = find_drive_item(session, MATCHED_TREES_SUBFOLDER_NAME, parent_id=ntblm_folder_id, drive_id=drive_id)
+    if trees_folder:
+        try:
+            session.delete(f"{DRIVE_API_V3_URL}/files/{trees_folder['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
+            logging.info(f"Deleted folder '{MATCHED_TREES_SUBFOLDER_NAME}' from Drive.")
+        except Exception as e:
+            logging.error(f"Failed to delete folder '{MATCHED_TREES_SUBFOLDER_NAME}': {e}")
+
+
 def parse_report(file_path):
     try:
         df = pd.read_excel(file_path, dtype=str).fillna('')
@@ -146,12 +169,12 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
         return {}, {}
         
     genai.configure(api_key=GEMINI_API_KEY) # type: ignore
-    model = genai.GenerativeModel(GEMINI_MODEL_NAME) # type: ignore
+    model = genai.GenerativeModel(GEMINI_MODEL_NAME)  #type: ignore
     
     folder_list_str = "\n".join([f"- {item['name']}" for item in drive_folders])
     
     all_consolidation_maps = {}
-    all_match_maps = {}
+    all_match_maps = defaultdict(list)
     
     for i in range(0, len(raw_client_names), AI_BATCH_SIZE):
         batch_names = raw_client_names[i:i + AI_BATCH_SIZE]
@@ -165,17 +188,17 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
         {client_list_str}
         </Raw_Client_Names>
 
-        Here is the list of the official, second-level client folder names found on Google Drive:
+        Here is the list of official client folder names found on Google Drive. Some are main folders, and some are sub-folders belonging to a larger "GRUPO".
         <Drive_Folder_Names>
         {folder_list_str}
         </Drive_Folder_Names>
 
         **Instructions:**
-        Step 1: Consolidate all names in <Raw_Client_Names> that refer to the same ultimate parent company into a single, clean "master name".
-        Step 2: Match each unique "master name" to the single best folder from <Drive_Folder_Names>.
+        Step 1: Consolidate all names in <Raw_Client_Names> that refer to the same ultimate parent company into a single, clean "master name". It is common for related companies (e.g., 'EMPRESA INOVA JP', 'INOVA RIO') to be consolidated into one master name (e.g., 'GRUPO INOVA').
+        Step 2: Match each unique "master name" to the best folder(s) from <Drive_Folder_Names>. A master name can match to multiple folders if they represent different branches of the same group (e.g., 'GRUPO INOVA' could match both 'GRUPO INOVA JP' and 'GRUPO INOVA RIO').
         Step 3: Return a single, valid JSON object with NO additional text or formatting. The JSON object must contain two keys:
-        1. "consolidation_map": A dictionary mapping every raw client name to its assigned "master name".
-        2. "match_map": A dictionary mapping each "master name" to its corresponding folder name from <Drive_Folder_Names> (or null if no match).
+        1. "consolidation_map": A dictionary mapping EVERY raw client name from the input to its assigned "master name".
+        2. "match_map": A dictionary mapping each "master name" to a LIST of its corresponding folder names from <Drive_Folder_Names> (or an empty list if no good match).
         """
         try:
             safety_settings = {
@@ -200,38 +223,47 @@ def perform_ai_consolidation_and_matching(raw_client_names: list[str], drive_fol
             ai_results = json.loads(cleaned_response)
             
             all_consolidation_maps.update(ai_results.get("consolidation_map", {}))
-            all_match_maps.update(ai_results.get("match_map", {}))
+            
+            # Merge the match maps
+            for master_name, folder_list in ai_results.get("match_map", {}).items():
+                all_match_maps[master_name].extend(folder_list)
 
         except Exception as e:
             logging.error(f"AI matching failed for batch {i//AI_BATCH_SIZE + 1}: {e}", exc_info=True)
             continue
         
         time.sleep(1)
-
-    folder_lookup = {f['name']: f for f in drive_folders}
-    final_match_map = {master_name: folder_lookup.get(folder_name) for master_name, folder_name in all_match_maps.items()}
     
     logging.info("Successfully received and processed all AI batches.")
-    return all_consolidation_maps, final_match_map
+    return all_consolidation_maps, dict(all_match_maps)
 
 
-def generate_and_upload_client_trees(session, client_to_folder_map, scan_data, trees_folder_id, drive_id):
-    logging.info(f"Generating and uploading folder trees for {len(client_to_folder_map)} changed clients...")
-    for master_name, folder_data in client_to_folder_map.items():
-        if not folder_data: continue
-        
-        client_folder_path = folder_data.get('path')
-        if not client_folder_path: continue
-
-        tree_items = [item for item in scan_data if item.get('path', '').startswith(client_folder_path)]
+def generate_and_upload_client_trees(session, client_to_folders_map, scan_data, trees_folder_id, drive_id):
+    logging.info(f"Generating and uploading folder trees for {len(client_to_folders_map)} changed clients...")
+    for master_name, folder_data_list in client_to_folders_map.items():
+        if not folder_data_list: continue
         
         tree_text = f"File tree for: {master_name}\n"
-        tree_text += "=" * (len(tree_text) - 1) + "\n"
-        for item in sorted(tree_items, key=lambda x: x.get('path', '')):
-            indent = item.get('indent', 0)
-            prefix = '  ' * (indent - 1) + '|- ' if indent > 0 else ''
-            tree_text += f"{prefix}{item.get('name', 'Unknown')}\n"
-        
+        tree_text += "=" * (len(tree_text) - 1) + "\n\n"
+
+        for i, folder_data in enumerate(folder_data_list):
+            client_folder_path = folder_data.get('path')
+            if not client_folder_path: continue
+            
+            tree_text += f"--- Source Folder: {folder_data.get('name')} ---\n"
+            
+            tree_items = [item for item in scan_data if item.get('path', '').startswith(client_folder_path)]
+            
+            for item in sorted(tree_items, key=lambda x: x.get('path', '')):
+                indent = item.get('indent', 0)
+                base_indent = client_folder_path.count('/')
+                prefix_indent = indent - base_indent
+                prefix = '  ' * (prefix_indent -1) + '|- ' if prefix_indent > 0 else ''
+                tree_text += f"{prefix}{item.get('name', 'Unknown')}\n"
+            
+            if i < len(folder_data_list) - 1:
+                tree_text += "\n"
+
         safe_filename = "".join(c for c in master_name if c.isalnum() or c in (' ', '_')).rstrip()
         local_tree_path = TEMP_DIR / f"{safe_filename}_tree.txt"
         with open(local_tree_path, 'w', encoding='utf-8') as f:
@@ -250,16 +282,19 @@ def generate_and_upload_client_trees(session, client_to_folder_map, scan_data, t
         except Exception as e:
             logging.error(f"Failed to upload tree for '{master_name}': {e}")
 
-def get_client_file_signatures(scan_data, client_folder_map):
+def get_client_file_signatures(scan_data, client_to_folders_map):
     client_signatures = {}
-    for client_name, folder_info in client_folder_map.items():
-        if not folder_info: continue
-        client_folder_path = folder_info.get("path")
-        file_ids = {item['id'] for item in scan_data if item.get("path", "").startswith(client_folder_path)}
+    for client_name, folder_info_list in client_to_folders_map.items():
+        if not folder_info_list: continue
+        
+        client_folder_paths = [f.get("path") for f in folder_info_list if f.get("path")]
+        file_ids = set()
+        for path in client_folder_paths:
+            file_ids.update({item['id'] for item in scan_data if item.get("path", "").startswith(path)})
         client_signatures[client_name] = file_ids
     return client_signatures
 
-def main():
+def main(args):
     logging.info(f"--- {APP_NAME} Started ---")
     session = AuthorizedSession(get_credentials())
     adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=Retry(total=5, backoff_factor=1))
@@ -274,6 +309,10 @@ def main():
             return logging.critical(f"Could not find the base folder '{BASE_UPLOAD_FOLDER_NAME}'. Exiting.")
         
         ntblm_folder_id = ntblm_folder['id']
+        
+        if args.full_run:
+            cleanup_drive_outputs(session, ntblm_folder_id, NTBLM_DRIVE_ID)
+
         logs_folder_id = find_or_create_folder(session, LOGS_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
         trees_folder_id = find_or_create_folder(session, MATCHED_TREES_SUBFOLDER_NAME, ntblm_folder_id, NTBLM_DRIVE_ID)
         
@@ -301,11 +340,11 @@ def main():
                 last_run_scan_data = [json.loads(line) for line in f if line.strip()]
 
         old_consolidation, old_matches = {}, {}
-        if last_match_item and download_file(session, last_match_item['id'], local_last_match_path):
+        if last_match_item and not args.full_run and download_file(session, last_match_item['id'], local_last_match_path):
             with open(local_last_match_path, 'r', encoding='utf-8') as f:
                 last_run_data = json.load(f)
             old_consolidation = last_run_data.get('report_client_consolidation_map', {})
-            old_matches = last_run_data.get('client_to_folder_map', {})
+            old_matches = last_run_data.get('client_to_folders_map', {})
             logging.info(f"Loaded {len(old_matches)} matches from the last run.")
 
         with open(local_current_scan_path, 'r', encoding='utf-8') as f: current_scan_data = [json.loads(line) for line in f if line.strip()]
@@ -314,15 +353,53 @@ def main():
         new_clients_to_process = [name for name in raw_client_names if name not in old_consolidation]
         logging.info(f"Found {len(new_clients_to_process)} new client names to process from the report.")
 
+        # --- Prepare folder lists for AI ---
         root_name = next((item['name'] for item in current_scan_data if item['id'] == DRIVE_FOLDER_ID), "ROOT")
-        client_folders = [item for item in current_scan_data if item.get('indent') == 1 and (item.get('path','').startswith(f"{root_name}/{CLIENTES_ATUAIS_NAME}/") or item.get('path','').startswith(f"{root_name}/{CLIENTES_INATIVOS_NAME}/"))]
+        scan_by_parent_id = defaultdict(list)
+        for item in current_scan_data:
+            if 'parents' in item and item['parents']:
+                scan_by_parent_id[item['parents'][0]].append(item)
 
-        new_consolidation, new_matches = perform_ai_consolidation_and_matching(new_clients_to_process, client_folders)
+        folders_for_ai = []
+        subfolder_to_grupo_parent_map = {}
+        
+        top_level_client_folders = [
+            item for item in current_scan_data 
+            if item.get('indent') == 1 and 
+            (item.get('path','').startswith(f"{root_name}/{CLIENTES_ATUAIS_NAME}/") or 
+             item.get('path','').startswith(f"{root_name}/{CLIENTES_INATIVOS_NAME}/"))
+        ]
+
+        for folder in top_level_client_folders:
+            folders_for_ai.append(folder)
+            if folder['name'].upper().startswith("GRUPO"):
+                child_folders = [item for item in scan_by_parent_id.get(folder['id'], []) if item['mimeType'] == 'application/vnd.google-apps.folder']
+                for child in child_folders:
+                    folders_for_ai.append(child)
+                    subfolder_to_grupo_parent_map[child['name']] = folder['name']
+        
+        logging.info(f"Prepared {len(folders_for_ai)} total folders for AI matching, including subfolders of GRUPO clients.")
+
+        new_consolidation, new_ai_matches = perform_ai_consolidation_and_matching(new_clients_to_process, folders_for_ai)
+
+        # --- Post-process AI results ---
+        folder_lookup = {f['name']: f for f in folders_for_ai}
+        processed_new_matches = defaultdict(list)
+        for master_name, matched_folder_names in new_ai_matches.items():
+            final_folder_names = set()
+            for folder_name in matched_folder_names:
+                parent_grupo = subfolder_to_grupo_parent_map.get(folder_name)
+                if parent_grupo:
+                    final_folder_names.add(parent_grupo)
+                else:
+                    final_folder_names.add(folder_name)
+            
+            processed_new_matches[master_name] = [folder_lookup[name] for name in final_folder_names if name in folder_lookup]
 
         final_consolidation = {**old_consolidation, **new_consolidation}
-        final_matches = {**old_matches, **new_matches}
+        final_matches = {**old_matches, **processed_new_matches}
         
-        results_to_save = {'client_to_folder_map': final_matches, 'report_client_consolidation_map': final_consolidation, 'all_parsed_report_rows': parsed_rows}
+        results_to_save = {'client_to_folders_map': final_matches, 'report_client_consolidation_map': final_consolidation, 'all_parsed_report_rows': parsed_rows}
         local_match_path = TEMP_DIR / "matching_results.json"
         with open(local_match_path, 'w', encoding='utf-8') as f: json.dump(results_to_save, f, indent=2, ensure_ascii=False)
         
@@ -356,4 +433,7 @@ def main():
         logging.info(f"{APP_NAME} finished.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Matches client reports to Google Drive folders.")
+    parser.add_argument("--full-run", action="store_true", help="Perform a full, clean run, ignoring previous matches.")
+    cli_args = parser.parse_args()
+    main(cli_args)
