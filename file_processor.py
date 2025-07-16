@@ -52,6 +52,7 @@ logging.basicConfig(
 )
 logging.getLogger("googleapiclient").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("PyPDF2").setLevel(logging.ERROR)
 
 # --- Load .env and Set Constants ---
 load_dotenv()
@@ -257,14 +258,18 @@ def process_client(client_plan_path):
     if not client_specific_folder:
         logging.error(f"Could not create output folder for {client_name}. Aborting.")
         return client_name, False
+    
+    tasks_by_id = {task['source_file_id']: task for task in plan['processing_tasks']}
 
     for file_type, batches in plan['concatenation_plan'].items():
         for i, batch in enumerate(batches):
             logging.info(f"Processing {file_type} batch {i+1}/{len(batches)} for {client_name}...")
             
+            tasks_for_this_batch = [tasks_by_id[task_id] for task_id in batch['source_tasks'] if task_id in tasks_by_id]
+            
             processed_tasks = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                future_to_task = {executor.submit(process_single_file, task, client_temp_dir): task for task in batch['source_tasks']}
+                future_to_task = {executor.submit(process_single_file, task, client_temp_dir): task for task in tasks_for_this_batch}
                 for future in concurrent.futures.as_completed(future_to_task):
                     result = future.result()
                     if result:
@@ -281,7 +286,10 @@ def process_client(client_plan_path):
                 merger = PdfWriter()
                 for task in processed_tasks:
                     if Path(task['processed_path']).exists():
-                        merger.append(task['processed_path'])
+                        try:
+                            merger.append(task['processed_path'])
+                        except Exception as e:
+                            logging.error(f"Could not append PDF {task['processed_path']} due to error: {e}. Skipping this file.")
                 merger.write(str(concatenated_path))
                 merger.close()
             elif file_type == 'txt':
@@ -298,7 +306,6 @@ def process_client(client_plan_path):
                 if Path(task['processed_path']).exists():
                     Path(task['processed_path']).unlink()
 
-    # After processing all batches, call the lawsuit reporter
     logging.info(f"Finished file processing for {client_name}. Generating lawsuit report...")
     try:
         subprocess.run([sys.executable, str(BASE_DIR / 'lawsuit_reporter.py'), client_name], check=True)
@@ -342,7 +349,6 @@ def main():
         if not plans_to_process_meta:
             return logging.info("All available plans have been processed. No new work to do.")
 
-        # Corrected: Only download the plans for the current run
         plans_for_this_run = plans_to_process_meta[:CLIENTS_PER_RUN]
         logging.info(f"Will process {len(plans_for_this_run)} plans in this run.")
         
