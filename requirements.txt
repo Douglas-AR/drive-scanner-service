@@ -15,3 +15,7 @@ python-Levenshtein
 google-generativeai
 docx2pdf
 PyPDF2
+reportlab
+python-docx
+pytesseract
+Pillow

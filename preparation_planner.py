@@ -9,6 +9,8 @@ import time
 import shutil
 from datetime import datetime
 import concurrent.futures
+import io
+import re
 
 import requests
 from dotenv import load_dotenv
@@ -16,6 +18,13 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from PyPDF2 import PdfWriter, PdfReader
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from docx import Document as DocxDocument
+import pandas as pd
+import pytesseract
+from PIL import Image
 
 # --- Basic Configuration ---
 APP_NAME = "PreparationPlanner"
@@ -30,7 +39,7 @@ LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE_PATH = LOG_DIR / f"{APP_NAME}.log"
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(processName)s - %(threadName)s - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE_PATH),
         logging.StreamHandler(sys.stdout)
@@ -46,15 +55,15 @@ BASE_UPLOAD_FOLDER_NAME = "3-NTBLM"
 LOGS_SUBFOLDER_NAME = "Logs"
 PREPARATION_PLANS_SUBFOLDER_NAME = "PreparationPlans"
 DRIVE_API_V3_URL = "https://www.googleapis.com/drive/v3"
-CONCATENATION_SIZE_LIMIT_MB = 190
+# Using a more conservative limit to account for size increases from OCR/conversion
+CONCATENATION_SIZE_LIMIT_MB = 150 
 MAX_WORKERS = 10
 
 # --- Core Functions ---
 def get_credentials():
     scopes = ['https://www.googleapis.com/auth/drive']
     try:
-        creds = service_account.Credentials.from_service_account_file(str(SERVICE_ACCOUNT_KEY_PATH), scopes=scopes)
-        return creds
+        return service_account.Credentials.from_service_account_file(str(SERVICE_ACCOUNT_KEY_PATH), scopes=scopes)
     except Exception as e:
         logging.critical(f"Failed to load credentials: {e}", exc_info=True)
         sys.exit(1)
@@ -68,8 +77,7 @@ def find_drive_item(session, name, parent_id=None, drive_id=None):
     try:
         response = session.get(f"{DRIVE_API_V3_URL}/files", params=params)
         response.raise_for_status()
-        files = response.json().get('files', [])
-        return files[0] if files else None
+        return response.json().get('files', [])[0] if response.json().get('files') else None
     except Exception: return None
 
 def find_or_create_folder(session, folder_name, parent_id, drive_id):
@@ -94,6 +102,22 @@ def download_file(session, file_id, destination_path):
         return True
     except Exception: return False
 
+def upload_or_overwrite_file(session, local_path, folder_id, drive_id, drive_filename):
+    if not local_path.exists() or local_path.stat().st_size == 0: return
+    try:
+        existing = find_drive_item(session, drive_filename, parent_id=folder_id, drive_id=drive_id)
+        if existing:
+            session.delete(f"{DRIVE_API_V3_URL}/files/{existing['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
+        
+        file_metadata = {'name': drive_filename, 'parents': [folder_id]}
+        with open(local_path, 'rb') as f:
+            files = {'data': ('metadata', json.dumps(file_metadata), 'application/json'), 'file': f}
+            response = session.post(f"https://www.googleapis.com/upload/drive/v3/files", params={'uploadType': 'multipart', 'supportsAllDrives': 'true'}, files=files)
+            response.raise_for_status()
+        logging.info(f"Successfully uploaded '{drive_filename}'.")
+    except Exception as e:
+        logging.error(f"Upload failed for '{drive_filename}': {e}")
+
 def backup_and_upload(session, local_path, folder_id, drive_id, current_filename, backup_filename):
     if not local_path.exists() or local_path.stat().st_size == 0:
         logging.info(f"Local file '{local_path.name}' is empty or missing. Skipping upload for '{current_filename}'.")
@@ -116,25 +140,6 @@ def backup_and_upload(session, local_path, folder_id, drive_id, current_filename
         logging.info(f"Successfully uploaded new '{current_filename}'.")
     except Exception as e:
         logging.error(f"Backup and upload failed for '{current_filename}': {e}")
-
-def upload_or_overwrite_file(session, local_path, folder_id, drive_id, drive_filename):
-    if not local_path.exists() or local_path.stat().st_size == 0:
-        logging.info(f"Local file '{local_path.name}' is empty or missing. Skipping upload for '{drive_filename}'.")
-        return
-    try:
-        existing_file = find_drive_item(session, drive_filename, parent_id=folder_id, drive_id=drive_id)
-        if existing_file:
-            session.delete(f"{DRIVE_API_V3_URL}/files/{existing_file['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
-            logging.info(f"Deleted existing file '{drive_filename}' to overwrite.")
-
-        file_metadata = {'name': drive_filename, 'parents': [folder_id]}
-        with open(local_path, 'rb') as f:
-            files = {'data': ('metadata', json.dumps(file_metadata), 'application/json'), 'file': f}
-            response = session.post(f"https://www.googleapis.com/upload/drive/v3/files", params={'uploadType': 'multipart', 'supportsAllDrives': 'true'}, files=files)
-            response.raise_for_status()
-        logging.info(f"Successfully uploaded '{drive_filename}'.")
-    except Exception as e:
-        logging.error(f"Upload/overwrite failed for '{drive_filename}': {e}")
 
 # --- Planner-Specific Functions ---
 def get_task_for_file(file_info):
@@ -173,7 +178,7 @@ def get_task_for_file(file_info):
     return task
 
 def plan_concatenation(tasks):
-    logging.info("Planning file concatenation...")
+    logging.info("Planning file concatenation based on estimated sizes...")
     files_by_type = {"txt": [], "pdf": [], "mp3": []}
     for task in tasks:
         if task["task_type"] == "IGNORE": continue
@@ -190,102 +195,71 @@ def plan_concatenation(tasks):
         for file_task in file_list:
             file_size = file_task["estimated_size_bytes"]
             if current_size + file_size > limit_bytes and current_batch:
-                concatenation_plan[file_type].append({"batch_id": f"{file_type}_batch_{batch_counter}", "total_size_mb": round(current_size / (1024*1024), 2), "source_tasks": current_batch})
+                concatenation_plan[file_type].append({"batch_id": f"{file_type}_batch_{batch_counter}", "total_size_mb": round(current_size / (1024*1024), 2), "source_tasks": [t['source_file_id'] for t in current_batch]})
                 current_batch, current_size, batch_counter = [], 0, batch_counter + 1
             current_batch.append(file_task)
             current_size += file_size
         if current_batch:
-            concatenation_plan[file_type].append({"batch_id": f"{file_type}_batch_{batch_counter}", "total_size_mb": round(current_size / (1024*1024), 2), "source_tasks": current_batch})
+            concatenation_plan[file_type].append({"batch_id": f"{file_type}_batch_{batch_counter}", "total_size_mb": round(current_size / (1024*1024), 2), "source_tasks": [t['source_file_id'] for t in current_batch]})
     logging.info("Concatenation planning complete.")
     return concatenation_plan
-
-def get_client_file_signatures(scan_data, client_folder_map):
-    """Creates a dictionary mapping each client to a set of their file IDs for easy comparison."""
-    client_signatures = {}
-    for client_name, folder_info in client_folder_map.items():
-        if not folder_info: continue
-        client_folder_path = folder_info.get("path")
-        file_ids = {item['id'] for item in scan_data if item.get("path", "").startswith(client_folder_path)}
-        client_signatures[client_name] = file_ids
-    return client_signatures
 
 def main():
     logging.info(f"--- {APP_NAME} Started ---")
     session = AuthorizedSession(get_credentials())
     adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=Retry(total=5, backoff_factor=1))
     session.mount("https://", adapter)
-
+    
+    ntblm_folder = None
     try:
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
         
         ntblm_folder = find_drive_item(session, BASE_UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
-        if not ntblm_folder:
-            return logging.critical(f"Could not find the base folder '{BASE_UPLOAD_FOLDER_NAME}'. Exiting.")
+        if not ntblm_folder: return logging.critical("Could not find base upload folder.")
         
         plans_folder_id = find_or_create_folder(session, PREPARATION_PLANS_SUBFOLDER_NAME, ntblm_folder['id'], NTBLM_DRIVE_ID)
-        if not plans_folder_id:
-            return logging.critical(f"Could not create the '{PREPARATION_PLANS_SUBFOLDER_NAME}' folder. Exiting.")
+        if not plans_folder_id: return logging.critical("Could not create plans folder.")
 
-        # --- Load all necessary files ---
         matcher_results_item = find_drive_item(session, "matching_results.json", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
-        current_scan_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
-        last_run_scan_item = find_drive_item(session, "drive_scan_last_run.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
-        
-        if not (matcher_results_item and current_scan_item):
-            return logging.critical("Could not find 'matching_results.json' or 'drive_scan.jsonl'. Exiting.")
+        scan_file_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
+        if not (matcher_results_item and scan_file_item): return logging.critical("Could not find 'matching_results.json' or 'drive_scan.jsonl'.")
 
         local_matcher_path = TEMP_DIR / "matching_results.json"
-        local_current_scan_path = TEMP_DIR / "drive_scan.jsonl"
-        local_last_scan_path = TEMP_DIR / "drive_scan_last_run.jsonl"
-        
+        local_scan_path = TEMP_DIR / "drive_scan.jsonl"
         download_file(session, matcher_results_item['id'], local_matcher_path)
-        download_file(session, current_scan_item['id'], local_current_scan_path)
-        
-        with open(local_matcher_path, 'r', encoding='utf-8') as f: matcher_data = json.load(f)
-        with open(local_current_scan_path, 'r', encoding='utf-8') as f: current_scan_data = [json.loads(line) for line in f if line.strip()]
-        
-        last_run_scan_data = []
-        if last_run_scan_item and download_file(session, last_run_scan_item['id'], local_last_scan_path):
-            with open(local_last_scan_path, 'r', encoding='utf-8') as f:
-                last_run_scan_data = [json.loads(line) for line in f if line.strip()]
-        
-        # --- Identify clients that need a new plan ---
-        client_folder_map = matcher_data.get("client_to_folder_map", {})
-        current_signatures = get_client_file_signatures(current_scan_data, client_folder_map)
-        last_run_signatures = get_client_file_signatures(last_run_scan_data, client_folder_map)
-        
-        clients_to_replan = []
-        for client, current_files in current_signatures.items():
-            last_files = last_run_signatures.get(client, set())
-            if current_files != last_files:
-                clients_to_replan.append(client)
-        
-        if not clients_to_replan:
-            return logging.info("No client folders have changed. No new plans needed.")
-            
-        logging.info(f"Found changes for {len(clients_to_replan)} clients. Generating new plans...")
+        download_file(session, scan_file_item['id'], local_scan_path)
 
-        # --- Generate plans only for changed clients ---
-        for client_name in clients_to_replan:
+        with open(local_matcher_path, 'r', encoding='utf-8') as f: matcher_data = json.load(f)
+        with open(local_scan_path, 'r', encoding='utf-8') as f: scan_data = [json.loads(line) for line in f if line.strip()]
+
+        all_matched_clients = [name for name, folder in matcher_data.get("client_to_folder_map", {}).items() if folder]
+        if not all_matched_clients: return logging.info("No matched clients found.")
+        
+        logging.info(f"Starting to generate plans for {len(all_matched_clients)} clients.")
+        client_folder_map = matcher_data.get("client_to_folder_map", {})
+
+        for client_name in all_matched_clients:
             logging.info(f"--- Planning for client: {client_name} ---")
+            
             client_folder_info = client_folder_map.get(client_name)
             if not client_folder_info: continue
             
             client_folder_path = client_folder_info.get("path")
-            client_files = [item for item in current_scan_data if item.get("path", "").startswith(client_folder_path)]
+            client_files = [item for item in scan_data if item.get("path", "").startswith(client_folder_path)]
             
+            initial_tasks = []
             for file_info in client_files:
                 file_info["client_master_name"] = client_name
+                initial_tasks.append(get_task_for_file(file_info))
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                processing_tasks = list(executor.map(get_task_for_file, client_files))
-            
-            concatenation_plan = plan_concatenation(processing_tasks)
+            # The 'processed_tasks' are now just the initial tasks, as we are not processing here.
+            # The size used for concatenation is the 'estimated_size_bytes'.
+            concatenation_plan = plan_concatenation(initial_tasks)
             
             client_plan = {
                 "plan_generated_at": datetime.now().isoformat(),
                 "client_master_name": client_name,
-                "processing_tasks": processing_tasks,
+                "processing_tasks": initial_tasks, # This contains all tasks, including ignored ones.
                 "concatenation_plan": concatenation_plan
             }
             
@@ -299,10 +273,9 @@ def main():
             upload_or_overwrite_file(session, local_plan_path, plans_folder_id, NTBLM_DRIVE_ID, plan_filename)
 
     except Exception as e:
-        logging.critical(f"A critical error occurred in the main planner process: {e}", exc_info=True)
+        logging.critical(f"A critical error occurred: {e}", exc_info=True)
     finally:
-        ntblm_folder = find_drive_item(session, BASE_UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
-        if ntblm_folder:
+        if 'session' in locals() and ntblm_folder:
             logs_folder_id = find_drive_item(session, LOGS_SUBFOLDER_NAME, parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
             if logs_folder_id:
                 backup_and_upload(session, LOG_FILE_PATH, logs_folder_id['id'], NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
