@@ -19,3 +19,5 @@ reportlab
 python-docx
 pytesseract
 Pillow
+libreoffice-convert
+python-libreoffice
