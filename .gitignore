@@ -4,6 +4,7 @@ authentication/
 
 # Python virtual environment
 venv/
+.venv
 
 # Logs and temporary files
 logs/

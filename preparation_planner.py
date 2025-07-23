@@ -10,6 +10,7 @@ import time
 import shutil
 from datetime import datetime
 import concurrent.futures
+from collections import defaultdict
 
 import requests
 from dotenv import load_dotenv
@@ -93,7 +94,16 @@ def download_file(session, file_id, destination_path):
         with open(destination_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192): f.write(chunk)
         return True
-    except Exception: return False
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            logging.warning(f"File with ID {file_id} not found (404). Skipping download.")
+        else:
+            logging.error(f"HTTP error downloading file {file_id}: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Generic error downloading file {file_id}: {e}")
+        return False
+
 
 def backup_and_upload(session, local_path, folder_id, drive_id, current_filename, backup_filename):
     if not local_path.exists() or local_path.stat().st_size == 0:
@@ -141,32 +151,37 @@ def cleanup_drive_plans(session, plans_folder_id, drive_id):
     logging.warning("--- FULL RUN: Cleaning up previous plans on Google Drive. ---")
     if not plans_folder_id: return
     
+    for item in list_all_files_in_folder(session, plans_folder_id, drive_id):
+        try:
+            session.delete(f"{DRIVE_API_V3_URL}/files/{item['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
+            logging.info(f"Deleted plan-related file '{item['name']}' from Drive.")
+        except Exception as e:
+            logging.error(f"Failed during plan cleanup for file {item['name']}: {e}")
+
+def list_all_files_in_folder(session, folder_id, drive_id):
+    """Helper to list all files in a folder, handling pagination."""
+    all_files = []
     next_page_token = None
     while True:
         try:
             params = {
-                'q': f"'{plans_folder_id}' in parents and trashed=false",
+                'q': f"'{folder_id}' in parents and trashed=false",
                 'fields': "nextPageToken, files(id, name)",
-                'supportsAllDrives': True,
-                'includeItemsFromAllDrives': True,
-                'pageSize': 100
+                'supportsAllDrives': True, 'includeItemsFromAllDrives': True, 'pageSize': 100
             }
             if next_page_token: params['pageToken'] = next_page_token
             
             response = session.get(f"{DRIVE_API_V3_URL}/files", params=params)
             response.raise_for_status()
             data = response.json()
-            
-            for item in data.get('files', []):
-                session.delete(f"{DRIVE_API_V3_URL}/files/{item['id']}", params={'supportsAllDrives': 'true'}).raise_for_status()
-                logging.info(f"Deleted plan file '{item['name']}' from Drive.")
+            all_files.extend(data.get('files', []))
             
             next_page_token = data.get('nextPageToken')
             if not next_page_token: break
         except Exception as e:
-            logging.error(f"Failed during plan cleanup: {e}")
+            logging.error(f"Failed to list files in folder {folder_id}: {e}")
             break
-
+    return all_files
 
 # --- Planner-Specific Functions ---
 def get_task_for_file(file_info):
@@ -204,35 +219,91 @@ def get_task_for_file(file_info):
         task["output_format"] = "none"
     return task
 
-def plan_concatenation(tasks):
-    logging.info("Planning file concatenation...")
-    files_by_type = {"txt": [], "pdf": [], "mp3": []}
-    for task in tasks:
-        if task["task_type"] == "IGNORE": continue
-        output_format = task["output_format"]
-        if output_format in files_by_type:
-            files_by_type[output_format].append(task)
-
-    concatenation_plan = {}
+def plan_concatenation(tasks, last_run_plan=None):
+    logging.info("Planning file concatenation with patch logic...")
     limit_bytes = CONCATENATION_SIZE_LIMIT_MB * 1024 * 1024
-    for file_type, file_list in files_by_type.items():
-        concatenation_plan[file_type] = []
-        if not file_list: continue
-        current_batch, current_size, batch_counter = [], 0, 1
-        for file_task in file_list:
-            file_size = file_task["estimated_size_bytes"]
-            if current_size + file_size > limit_bytes and current_batch:
-                concatenation_plan[file_type].append({"batch_id": f"{file_type}_batch_{batch_counter}", "total_size_mb": round(current_size / (1024*1024), 2), "source_tasks": current_batch})
-                current_batch, current_size, batch_counter = [], 0, batch_counter + 1
-            current_batch.append(file_task)
-            current_size += file_size
-        if current_batch:
-            concatenation_plan[file_type].append({"batch_id": f"{file_type}_batch_{batch_counter}", "total_size_mb": round(current_size / (1024*1024), 2), "source_tasks": current_batch})
+    
+    current_tasks_map = {task['source_file_id']: task for task in tasks if task['task_type'] != "IGNORE"}
+    
+    old_batches = {}
+    if last_run_plan:
+        for file_type, batch_list in last_run_plan.get("concatenation_plan", {}).items():
+            for batch in batch_list:
+                old_batches[batch['batch_id']] = batch
+
+    new_concatenation_plan = defaultdict(list)
+    
+    old_task_ids = set(task['source_file_id'] for task in last_run_plan.get('processing_tasks', [])) if last_run_plan else set()
+    current_task_ids = set(current_tasks_map.keys())
+    
+    new_task_ids = current_task_ids - old_task_ids
+    deleted_task_ids = old_task_ids - current_task_ids
+    
+    for batch_id, old_batch in old_batches.items():
+        new_batch_tasks = []
+        current_size = 0
+        file_type = batch_id.split('_')[0]
+        
+        for old_task in old_batch.get('source_tasks', []):
+            task_id = old_task['source_file_id']
+            if task_id in deleted_task_ids:
+                continue
+            
+            new_task = current_tasks_map[task_id]
+            new_batch_tasks.append(new_task)
+            current_size += new_task['estimated_size_bytes']
+
+        if new_batch_tasks:
+            new_batch = {
+                "batch_id": batch_id,
+                "total_size_mb": round(current_size / (1024*1024), 2),
+                "source_tasks": new_batch_tasks
+            }
+            new_concatenation_plan[file_type].append(new_batch)
+
+    for batch_list in list(new_concatenation_plan.values()):
+        for b in list(batch_list):
+            current_size = sum(t['estimated_size_bytes'] for t in b['source_tasks'])
+            if current_size > limit_bytes:
+                logging.warning(f"Batch {b['batch_id']} exceeds size limit after updates. Deconstructing.")
+                new_task_ids.update(t['source_file_id'] for t in b['source_tasks'])
+                batch_list.remove(b)
+
+    tasks_to_place = [current_tasks_map[tid] for tid in new_task_ids]
+    for task in sorted(tasks_to_place, key=lambda x: x['estimated_size_bytes'], reverse=True):
+        file_type = task['output_format']
+        placed = False
+        
+        eligible_batches = sorted(
+            [b for b in new_concatenation_plan[file_type] if sum(t['estimated_size_bytes'] for t in b['source_tasks']) + task['estimated_size_bytes'] <= limit_bytes],
+            key=lambda b: sum(t['estimated_size_bytes'] for t in b['source_tasks'])
+        )
+
+        if eligible_batches:
+            target_batch = eligible_batches[0]
+            target_batch['source_tasks'].append(task)
+            new_size = sum(t['estimated_size_bytes'] for t in target_batch['source_tasks'])
+            target_batch['total_size_mb'] = round(new_size / (1024*1024), 2)
+            placed = True
+
+        if not placed:
+            batch_counter = len(new_concatenation_plan[file_type]) + 1
+            new_batch_id = f"{file_type}_batch_{batch_counter}"
+            while any(b['batch_id'] == new_batch_id for b in new_concatenation_plan[file_type]):
+                batch_counter +=1
+                new_batch_id = f"{file_type}_batch_{batch_counter}"
+
+            new_batch = {
+                "batch_id": new_batch_id,
+                "total_size_mb": round(task['estimated_size_bytes'] / (1024*1024), 2),
+                "source_tasks": [task]
+            }
+            new_concatenation_plan[file_type].append(new_batch)
+
     logging.info("Concatenation planning complete.")
-    return concatenation_plan
+    return dict(new_concatenation_plan)
 
 def get_client_file_signatures(scan_data, client_to_folders_map):
-    """Creates a dictionary mapping each client to a set of their file IDs for easy comparison."""
     client_signatures = {}
     for client_name, folder_info_list in client_to_folders_map.items():
         if not folder_info_list: continue
@@ -243,6 +314,57 @@ def get_client_file_signatures(scan_data, client_to_folders_map):
             file_ids.update({item['id'] for item in scan_data if item.get("path", "").startswith(path)})
         client_signatures[client_name] = file_ids
     return client_signatures
+
+def generate_and_upload_diff(session, baseline_plan, new_plan, client_name, plans_folder_id, drive_id):
+    diffs = []
+    
+    # If there's no baseline, the entire plan is "new"
+    if baseline_plan is None:
+        baseline_plan = {}
+        logging.info(f"No baseline plan found for '{client_name}'. Generating full diff.")
+
+    old_file_to_batch = {task['source_file_id']: batch['batch_id'] 
+                         for bl in baseline_plan.get("concatenation_plan", {}).values() for batch in bl for task in batch['source_tasks']}
+    new_file_to_batch = {task['source_file_id']: batch['batch_id'] 
+                         for bl in new_plan.get("concatenation_plan", {}).values() for batch in bl for task in batch['source_tasks']}
+
+    all_file_ids = set(old_file_to_batch.keys()) | set(new_file_to_batch.keys())
+
+    for file_id in all_file_ids:
+        old_batch = old_file_to_batch.get(file_id)
+        new_batch = new_file_to_batch.get(file_id)
+        
+        task = next((t for t in new_plan.get("processing_tasks", []) if t.get('source_file_id') == file_id), None)
+        if not task:
+            task = next((t for t in baseline_plan.get("processing_tasks", []) if t.get('source_file_id') == file_id), None)
+        
+        file_name = task.get('source_file_name', 'Unknown File') if task else 'Unknown File'
+
+        if old_batch != new_batch:
+            if old_batch and new_batch:
+                diffs.append(f"MOVED: '{file_name}' (ID: {file_id}) moved from {old_batch} to {new_batch}.")
+            elif new_batch:
+                diffs.append(f"ADDED: '{file_name}' (ID: {file_id}) was added to {new_batch}.")
+            elif old_batch:
+                diffs.append(f"REMOVED: '{file_name}' (ID: {file_id}) was removed from {old_batch}.")
+
+    if not diffs:
+        logging.info(f"No cumulative changes detected for client '{client_name}'.")
+        return
+
+    diff_text = f"Cumulative plan changes for client: {client_name} at {datetime.now().isoformat()}\n\n"
+    diff_text += "\n".join(diffs)
+
+    safe_filename = "".join(c for c in client_name if c.isalnum() or c in (' ', '_')).rstrip()
+    diff_filename = f"{safe_filename}_plan_diff.txt"
+    local_diff_path = TEMP_DIR / diff_filename
+
+    with open(local_diff_path, 'w', encoding='utf-8') as f:
+        f.write(diff_text)
+        
+    logging.info(f"Uploading cumulative plan diff for '{client_name}'.")
+    upload_or_overwrite_file(session, local_diff_path, plans_folder_id, NTBLM_DRIVE_ID, diff_filename)
+
 
 def main(args):
     logging.info(f"--- {APP_NAME} Started ---")
@@ -264,7 +386,6 @@ def main(args):
         if args.full_run:
             cleanup_drive_plans(session, plans_folder_id, NTBLM_DRIVE_ID)
 
-        # --- Load all necessary files ---
         matcher_results_item = find_drive_item(session, "matching_results.json", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
         current_scan_item = find_drive_item(session, "drive_scan.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
         last_run_scan_item = find_drive_item(session, "drive_scan_last_run.jsonl", parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
@@ -287,7 +408,6 @@ def main(args):
             with open(local_last_scan_path, 'r', encoding='utf-8') as f:
                 last_run_scan_data = [json.loads(line) for line in f if line.strip()]
         
-        # --- Identify clients that need a new plan ---
         client_to_folders_map = matcher_data.get("client_to_folders_map", {})
         
         clients_to_replan = []
@@ -304,31 +424,59 @@ def main(args):
                     clients_to_replan.append(client)
         
         if not clients_to_replan:
-            return logging.info("No clients require plan generation.")
+            logging.info("No clients require plan generation.")
+            return
             
         logging.info(f"Found {len(clients_to_replan)} clients to generate plans for. Generating new plans...")
 
-        # --- Generate plans only for identified clients ---
         for client_name in clients_to_replan:
             logging.info(f"--- Planning for client: {client_name} ---")
             client_folder_info_list = client_to_folders_map.get(client_name)
             if not client_folder_info_list: continue
-            
-            client_folder_paths = [f.get("path") for f in client_folder_info_list if f.get("path")]
-            client_files = []
-            for path in client_folder_paths:
-                client_files.extend([item for item in current_scan_data if item.get("path", "").startswith(path)])
-            
-            # Deduplicate files in case of overlapping folder paths
-            client_files = list({f['id']: f for f in client_files}.values())
 
+            safe_filename = "".join(c for c in client_name if c.isalnum() or c in (' ', '_')).rstrip()
+            plan_filename = f"{safe_filename}_plan.json"
+            last_run_plan_filename = f"{safe_filename}_plan_last_run.json"
+            # NEW: Filename for the stable baseline plan
+            last_processed_filename = f"{safe_filename}_plan_last_processed.json"
+            
+            # --- Download plans for patch and diff ---
+            local_last_run_plan_path = TEMP_DIR / last_run_plan_filename
+            local_last_processed_plan_path = TEMP_DIR / last_processed_filename
+            last_run_plan = None
+            diff_baseline_plan = None
+
+            # Download the last run plan for efficient batching
+            last_run_item = find_drive_item(session, plan_filename, parent_id=plans_folder_id, drive_id=NTBLM_DRIVE_ID)
+            if last_run_item and download_file(session, last_run_item['id'], local_last_run_plan_path):
+                try:
+                    with open(local_last_run_plan_path, 'r', encoding='utf-8') as f:
+                        last_run_plan = json.load(f)
+                    logging.info(f"Successfully loaded last run plan for '{client_name}' for batching.")
+                except (json.JSONDecodeError, FileNotFoundError):
+                    logging.warning(f"Could not load local last run plan for {client_name}.")
+
+            # NEW: Download the last PROCESSED plan to use as a baseline for the cumulative diff
+            last_processed_item = find_drive_item(session, last_processed_filename, parent_id=plans_folder_id, drive_id=NTBLM_DRIVE_ID)
+            if last_processed_item and download_file(session, last_processed_item['id'], local_last_processed_plan_path):
+                try:
+                    with open(local_last_processed_plan_path, 'r', encoding='utf-8') as f:
+                        diff_baseline_plan = json.load(f)
+                    logging.info(f"Successfully loaded last processed plan for '{client_name}' for diffing.")
+                except (json.JSONDecodeError, FileNotFoundError):
+                    logging.warning(f"Could not load local last processed plan for {client_name}.")
+            
+            # --- Generate the new plan ---
+            client_folder_paths = [f.get("path") for f in client_folder_info_list if f.get("path")]
+            client_files = [item for path in client_folder_paths for item in current_scan_data if item.get("path", "").startswith(path)]
+            client_files = list({f['id']: f for f in client_files}.values())
             for file_info in client_files:
                 file_info["client_master_name"] = client_name
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 processing_tasks = list(executor.map(get_task_for_file, client_files))
             
-            concatenation_plan = plan_concatenation(processing_tasks)
+            concatenation_plan = plan_concatenation(processing_tasks, last_run_plan)
             
             client_plan = {
                 "plan_generated_at": datetime.now().isoformat(),
@@ -338,23 +486,28 @@ def main(args):
                 "concatenation_plan": concatenation_plan
             }
             
-            safe_filename = "".join(c for c in client_name if c.isalnum() or c in (' ', '_')).rstrip()
-            plan_filename = f"{safe_filename}_plan.json"
+            # --- Upload files and generate cumulative diff ---
             local_plan_path = TEMP_DIR / plan_filename
-            
             with open(local_plan_path, 'w', encoding='utf-8') as f:
                 json.dump(client_plan, f, indent=2, ensure_ascii=False)
             
-            upload_or_overwrite_file(session, local_plan_path, plans_folder_id, NTBLM_DRIVE_ID, plan_filename)
+            backup_and_upload(session, local_plan_path, plans_folder_id, NTBLM_DRIVE_ID, plan_filename, last_run_plan_filename)
+
+            generate_and_upload_diff(session, diff_baseline_plan, client_plan, client_name, plans_folder_id, NTBLM_DRIVE_ID)
 
     except Exception as e:
         logging.critical(f"A critical error occurred in the main planner process: {e}", exc_info=True)
     finally:
+        # Final cleanup and log upload
+        logs_folder_id = None
         ntblm_folder = find_drive_item(session, BASE_UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
         if ntblm_folder:
             logs_folder_id_item = find_drive_item(session, LOGS_SUBFOLDER_NAME, parent_id=ntblm_folder['id'], drive_id=NTBLM_DRIVE_ID)
             if logs_folder_id_item:
-                backup_and_upload(session, LOG_FILE_PATH, logs_folder_id_item['id'], NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
+                logs_folder_id = logs_folder_id_item['id']
+        
+        if logs_folder_id:
+            backup_and_upload(session, LOG_FILE_PATH, logs_folder_id, NTBLM_DRIVE_ID, f"{APP_NAME}.log", f"{APP_NAME}_last_run.log")
         
         if TEMP_DIR.exists():
             shutil.rmtree(TEMP_DIR)
