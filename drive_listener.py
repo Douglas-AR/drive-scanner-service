@@ -228,11 +228,12 @@ def check_for_new_report_and_trigger(session, state, full_run=False):
 
     if full_run or (current_mod_time and current_mod_time != last_known_mod_time):
         trigger_reason = "Full run requested" if full_run else f"New report file detected (Modified: {current_mod_time})"
-        logging.info(f"{trigger_reason}. Triggering matcher and planner.")
+        logging.info(f"{trigger_reason}. Triggering other scripts.")
         
         full_run_flag = "--full-run" if full_run else ""
-        os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'} {full_run_flag}")
-        os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'} {full_run_flag}")
+        # The following lines are commented out as per the user's request.
+        # os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'} {full_run_flag}")
+        # os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'} {full_run_flag}")
         
         state["last_report_modified_time"] = current_mod_time
     else:
@@ -256,11 +257,12 @@ def run_full_scan_workflow(session, full_run=False):
     upload_folder = find_drive_item_by_name(session, UPLOAD_FOLDER_NAME, drive_id=NTBLM_DRIVE_ID)
     if upload_folder:
         backup_and_upload(session, local_scan_path, upload_folder['id'], NTBLM_DRIVE_ID, "drive_scan.jsonl", "drive_scan_last_run.jsonl")
-        logging.info("Full scan complete. Triggering matcher and planner.")
+        logging.info("Full scan complete. Downstream script triggers are now disabled.")
         
         full_run_flag = "--full-run" if full_run else ""
-        os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'} {full_run_flag}")
-        os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'} {full_run_flag}")
+        # The following lines are commented out as per the user's request.
+        # os.system(f"{sys.executable} {BASE_DIR / 'report_matcher.py'} {full_run_flag}")
+        # os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'} {full_run_flag}")
     else:
         logging.error(f"Could not find the upload folder '{UPLOAD_FOLDER_NAME}' in the specified NTBLM drive.")
 
@@ -303,8 +305,9 @@ def run_patch_workflow(session, changes):
 
         backup_and_upload(session, local_scan_path, upload_folder['id'], NTBLM_DRIVE_ID, "drive_scan.jsonl", "drive_scan_last_run.jsonl")
         
-        logging.info("Client folder changes detected. Triggering preparation planner only.")
-        os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'}")
+        logging.info("Client folder changes detected. Downstream script triggers are now disabled.")
+        # The following line is commented out as per the user's request.
+        # os.system(f"{sys.executable} {BASE_DIR / 'preparation_planner.py'}")
         
         return True
     except Exception as e:
